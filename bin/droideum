@@ -11,6 +11,14 @@
 # =============================================================================
 set -euo pipefail
 
+# This script uses bash 4+ features (mapfile, associative arrays). macOS ships
+# bash 3.2 as /bin/bash, so say so plainly instead of dying on "mapfile: not found".
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  printf 'err  droideum needs bash 4 or newer (this is %s).\n' "${BASH_VERSION:-unknown}" >&2
+  printf '     Termux/Linux: fine. macOS: brew install bash, then run it with that shell.\n' >&2
+  exit 1
+fi
+
 DROIDEUM_VERSION="1.3.0"
 
 # --- locations ---------------------------------------------------------------
@@ -247,11 +255,14 @@ _drive() {
 }
 
 _qemu_common() {
+  local -a accel=() cpu=()
+  mapfile -t accel < <(_accel_args)
+  mapfile -t cpu < <(_cpu_args)
   printf '%s\n' \
     -m "$RAM_MB" \
     -smp "$CORES" \
-    $(_accel_args) \
-    $(_cpu_args) \
+    "${accel[@]}" \
+    "${cpu[@]}" \
     -rtc base=utc \
     -device qemu-xhci \
     -device usb-tablet \
@@ -261,8 +272,10 @@ _qemu_common() {
     -monitor "unix:${MON_SOCK},server,nowait" \
     -serial "tcp:127.0.0.1:${CONSOLE_PORT},server,nowait" \
     -name droideum-android
-  [ -n "$EXTRA_QEMU_ARGS" ] && printf '%s\n' $EXTRA_QEMU_ARGS
-  return 0
+  [ -n "$EXTRA_QEMU_ARGS" ] || return 0
+  # deliberate word splitting: EXTRA_QEMU_ARGS is a list of flags, not one argument
+  # shellcheck disable=SC2086
+  printf '%s\n' $EXTRA_QEMU_ARGS
 }
 
 # One HMP command to a running QEMU (savevm / loadvm / system_powerdown / quit).
@@ -733,18 +746,36 @@ cmd_console() {
       return 0 ;;
     read|log)
       tail -n "${2:-40}" "$CONSOLE_LOG" 2>/dev/null | tr -d '\r' || warn "no console log yet" ;;
+    wait)
+      shift
+      local pat="${1:-}" limit="${2:-180}" waited=0
+      [ -n "$pat" ] || die "usage: droideum console wait '<regex>' [timeout_s]"
+      vm_pid >/dev/null || die "the VM is not running"
+      : >> "$CONSOLE_LOG"
+      while [ "$waited" -lt "$limit" ]; do
+        if tail -c 262144 "$CONSOLE_LOG" 2>/dev/null | tr -d '\r' | grep -qE -- "$pat"; then
+          ok "console matched /$pat/ after ${waited}s"
+          tail -c 4000 "$CONSOLE_LOG" | tr -d '\r' | tail -6
+          return 0
+        fi
+        sleep 1; waited=$((waited + 1))
+      done
+      printf '%serr%s console did not match /%s/ within %ss\n' "$C_E" "$C_R" "$pat" "$limit" >&2
+      return 1 ;;
     bridge|start)
       vm_pid >/dev/null || die "start the VM first (droideum up / install)"
       info "bridging the guest serial console (Ctrl-C to detach; the guest keeps running)"
       console_bridge ;;
     ""|help|-h|--help)
       cat <<EOF
-usage: droideum console {bridge|send 'cmd'|read}
+usage: droideum console {bridge|send 'cmd'|read|wait '<regex>' [timeout]}
 
   bridge   attach a bridge so the guest serial console is bidirectional
            (log: $CONSOLE_LOG, mailbox: $CONSOLE_IN)
   send     queue one command for the guest shell
   read     show the last lines the guest printed
+  wait     block until the guest prints a line matching a regex (deterministic
+           alternative to sleeping) — exits 0 on match, 1 on timeout
 
 Why this exists: adbd may be down, unauthorised, or simply not there (non-Android
 image). The serial port always works, and Android-x86 exposes a root shell on it.
@@ -855,9 +886,12 @@ cmd_up() {
       if ! disk_has_boot_sector; then
         die "no installed Android on the disk — run 'droideum install' first (this is not a boot timeout)"
       fi
-      [ "$want_display" -eq 0 ] && DISPLAY_BACKEND=none
+      # headless for 'up' unless a display was explicitly wanted; the launch is
+      # one-shot, so the caller's backend must be put back afterwards
+      local saved_backend="$DISPLAY_BACKEND"
+      if [ "$want_display" -eq 0 ]; then DISPLAY_BACKEND=none; fi
       LOADVM="" _launch "Booting headless for agent use" -drive "$(_drive)" -boot c
-      DISPLAY_BACKEND="${DISPLAY_BACKEND}"
+      DISPLAY_BACKEND="$saved_backend"
     fi
   else
     info "VM already running"
@@ -1015,7 +1049,15 @@ cmd_restore() {
   ok "restored $name -> $DISK_FILE"
 }
 
-cmd_snapshots() { load_config; ls -1 "$SNAP_DIR" 2>/dev/null | sed 's/\.qcow2$//' || warn "no snapshots"; }
+cmd_snapshots() {
+  load_config
+  local found=0 f
+  while IFS= read -r f; do
+    printf '%s\n' "$(basename "$f" .qcow2)"; found=1
+  done < <(find "$SNAP_DIR" -maxdepth 1 -name '*.qcow2' 2>/dev/null | sort)
+  [ "$found" -eq 1 ] || warn "no saved states yet (droideum snapshot <name>)"
+  return 0
+}
 
 # --- post-boot tuning -------------------------------------------------------
 # Android's default animations cost 0.3-1s of "still animating" per screen, which
@@ -1075,9 +1117,10 @@ cmd_bench() {
   load_config; adb_connect
   local rounds="${1:-3}"
   step "Benchmarking the VM ($rounds rounds)"
-  local dump_ms=0 cap_ms=0 tap_ms=0 cap_bytes=0 i
+  local dump_ms=0 cap_ms=0 tap_ms=0 cap_bytes=0
 
-  for i in $(seq 1 "$rounds"); do
+  local round
+  for ((round = 1; round <= rounds; round++)); do
     local t0 t1
     t0=$(date +%s%3N); adb_ shell uiautomator dump /sdcard/bench.xml >/dev/null 2>&1 || true
     t1=$(date +%s%3N); dump_ms=$((dump_ms + t1 - t0))
@@ -1109,7 +1152,8 @@ cmd_bench() {
   say "  ${C_D}interpretation: an iteration is roughly dump + settle. Under 4 s is workable."
   say "  Lower it with: droideum tune (animations off), a smaller screen, more CORES.${C_R}"
 
-  local out="$LOG_DIR/bench-$(date +%Y%m%d-%H%M%S).json"
+  local out
+  out="$LOG_DIR/bench-$(date +%Y%m%d-%H%M%S).json"
   printf '{"dump_ms":%s,"capture_ms":%s,"capture_bytes":%s,"tap_settle_ms":%s,"screen":"%s","cores":%s,"ram_mb":%s}\n' \
     "$d" "$c" "$cap_bytes" "$t" "$(adb_ shell wm size | tr -d '\r' | grep -o '[0-9]*x[0-9]*' | head -1)" \
     "$CORES" "$RAM_MB" > "$out"
@@ -1135,7 +1179,7 @@ cmd_pull() {
   load_config; adb_connect
   [ $# -ge 1 ] || die "usage: droideum pull /sdcard/Download/file.png [local_dir]"
   local src="$1" dest="${2:-.}"
-  adb_ pull "$src" "$dest" >/dev/null 2>&1 && ok "$src -> $dest" || die "pull failed: $src"
+  if adb_ pull "$src" "$dest" >/dev/null 2>&1; then ok "$src -> $dest"; else die "pull failed: $src"; fi
 }
 
 # --- image profiles ---------------------------------------------------------
@@ -1158,11 +1202,11 @@ cmd_profile() {
     use)
       local name="${1:-}"
       [ -n "$name" ] || die "usage: droideum profile use android9|android9-lite|bliss14|custom"
-      local url sha ram extra="" tb="$TB_SIZE"
+      local url sha ram extra="" tb=""
       case "$name" in
         android9)      url="$ISO_URL"; sha="$ISO_SHA1"; ram=2048 ;;
         android9-lite) url="$ISO_URL"; sha="$ISO_SHA1"; ram=1536
-                       extra="-device virtio-vga" ;;
+                       extra="-device virtio-vga"; tb=32 ;;
         bliss14)       url="https://sourceforge.net/projects/blissos-dev/files/Beta/Bliss-v14.10-x86_64-OFFICIAL-foss-20230310.iso"
                        sha="skip"; ram=3072 ;;
         custom)        url="${ISO_URL}"; sha="skip"; ram="$RAM_MB" ;;
@@ -1179,6 +1223,7 @@ cmd_profile() {
         echo "ISO_URL=\"$url\""
         echo "ISO_SHA1=\"$sha\""
         echo "RAM_MB=\"$ram\""
+        [ -n "$tb" ] && echo "TB_SIZE=\"$tb\""
         [ -n "$extra" ] && echo "EXTRA_QEMU_ARGS=\"$extra\""
         echo "# <<< droideum profile"
       } >> "$CONFIG_FILE"
@@ -1208,9 +1253,13 @@ cmd_lab() {
       if ! command -v apktool >/dev/null 2>&1; then
         info "falling back to the upstream apktool jar"
         curl -L --fail -o /usr/local/bin/apktool.jar \
-          https://github.com/iBotPeaches/Apktool/releases/latest/download/apktool.jar 2>/dev/null \
-          && printf '#!/bin/sh\nexec java -jar /usr/local/bin/apktool.jar "$@"\n' > /usr/local/bin/apktool \
-          && chmod +x /usr/local/bin/apktool && ok "apktool (jar)" || warn "apktool unavailable"
+          https://github.com/iBotPeaches/Apktool/releases/latest/download/apktool.jar 2>/dev/null
+        if [ -s /usr/local/bin/apktool.jar ]; then
+          printf '#!/bin/sh\nexec java -jar /usr/local/bin/apktool.jar "$@"\n' > /usr/local/bin/apktool
+          chmod +x /usr/local/bin/apktool && ok "apktool (jar)"
+        else
+          warn "apktool unavailable"
+        fi
       fi
       ok "lab ready — try: droideum lab info app.apk" ;;
     info)
@@ -1259,6 +1308,16 @@ cmd_doctor() {
     local snaps; snaps=$(vm_snapshots | tr '\n' ' ')
     [ -n "$snaps" ] && say "  saved states: $snaps"
     say "  disk on flash: $(du -h "$DISK_FILE" 2>/dev/null | cut -f1) / virtual $(qemu-img info --output=json "$DISK_FILE" 2>/dev/null | tr -d ' \n' | grep -o '"virtual-size":[0-9]*' | cut -d: -f2 | awk '{printf "%.0fG", $1/1073741824}')"
+  fi
+
+  for opt in mformat mcopy mtools; do
+    if command -v "$opt" >/dev/null 2>&1; then ok "$opt (droideum transfer)"; fi
+  done
+  if ! command -v mformat >/dev/null 2>&1; then
+    warn "mtools missing: 'droideum transfer' cannot build the USB image (pkg install mtools)"
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 missing: 'droideum console bridge' and the agent server need it"
   fi
 
   say ""
@@ -1321,6 +1380,7 @@ ${C_B}BOOTING / CONSOLE${C_R}
   droideum live                  run the ISO from RAM, no install, no disk
   droideum console bridge        attach to the guest serial console (root shell, no adb)
   droideum console send 'cmd'    run one command in the guest
+  droideum console wait 'regex'  block until the guest prints it (no sleeps)
   droideum transfer app.apk      hot-plug the file as USB storage (works without adb)
 
 ${C_B}IMAGES${C_R}

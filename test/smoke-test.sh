@@ -5,6 +5,7 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+DROIDEUM_ROOT="$HERE"
 WORK="$(mktemp -d)"
 STUB="$WORK/stub"
 mkdir -p "$STUB"
@@ -360,6 +361,14 @@ has "unknown console sub is reported" "unknown console subcommand" "$WORK/out"
 run console >/dev/null
 has "console help explains why"    "adbd may be down" "$WORK/out"
 
+# console wait: deterministic signalling instead of sleeping
+printf 'booting\nconsole:/ # \n' > "$DROIDEUM_HOME/run/console.log"
+t   "console wait matches at once"  "0" "$(run console wait 'console:/ #' 5)"
+has "console wait says it matched" "console matched" "$WORK/out"
+t   "console wait times out"        "1" "$(run console wait 'never-appears-here' 1)"
+has "console wait explains the timeout" "did not match" "$WORK/out"
+t   "console wait needs a regex"    "1" "$(run console wait)"
+
 printf 'APKDATA' > "$WORK/app.apk"
 t   "transfer exits 0"             "0" "$(run transfer "$WORK/app.apk")"
 has "transfer formats a FAT image" "mformat" "$STUB_CALLS"
@@ -380,6 +389,15 @@ export RAM_MB=768
 run doctor >/dev/null
 has "doctor warns about low RAM"   "below what Android 9 needs" "$WORK/out"
 export RAM_MB=1536
+
+echo "== packaging =="
+for f in bin/droideum bin/droideum-agentd install.sh test/smoke-test.sh; do
+  t "shipped file is executable: $f" "0" "$([ -x "$DROIDEUM_ROOT/$f" ] && echo 0 || echo 1)"
+done
+t "bin/droideum --version works when invoked directly" "0" \
+  "$("$DROIDEUM_ROOT/bin/droideum" --version >/dev/null 2>&1; echo $?)"
+t "version string is semver" "0" "$(bash "$D" --version | grep -qE '^droideum [0-9]+\.[0-9]+\.[0-9]+$' && echo 0 || echo 1)"
+t "no token-shaped secrets committed" "0" "$(grep -rIl 'ghp_[A-Za-z0-9]\{20,\}' "$DROIDEUM_ROOT" --exclude-dir=.git 2>/dev/null | wc -l | tr -d ' ')"
 
 echo
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"

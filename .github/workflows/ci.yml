@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: lint + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck mtools qemu-utils
+
+      - name: shellcheck
+        run: shellcheck -S info bin/droideum install.sh test/smoke-test.sh
+
+      - name: smoke tests (CLI, stubbed QEMU/adb — no VM needed)
+        run: bash test/smoke-test.sh
+
+      - name: MCP server tests (stubbed adb)
+        run: STUB_ADB=1 python3 test/mcp-test.py
+
+      - name: agent server selftest
+        run: ./bin/droideum-agentd selftest
+
+      - name: version
+        run: ./bin/droideum --version

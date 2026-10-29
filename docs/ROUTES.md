@@ -111,3 +111,12 @@ Random-read speed from the virtual disk and the software VGA blit dominate — n
 | move a file in with no networking | `droideum transfer file.apk` | adb push needs the same handshake that failed |
 | try the image without touching the disk | `droideum live` | install is a GUI wizard |
 | debugging a boot that never completes | `droideum console read`, `shots/` | `adb logcat` is unavailable until boot finishes |
+| wait for the guest to reach a state | `droideum console wait 'console:/ #' 300` | polling with `sleep` is slow and flaky |
+
+`console wait` exits 0 the moment the guest prints a matching line and 1 on timeout, so an agent
+can replace every "sleep and hope" with a real condition:
+
+```bash
+droideum console send 'pm install -r /mnt/x/app.apk'
+droideum console wait 'Success|Failure' 900     # returns as soon as Android answers
+```

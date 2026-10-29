@@ -1,5 +1,11 @@
 # droideum
 
+[![ci](https://github.com/lorenzz20105-del/droideum-termux/actions/workflows/ci.yml/badge.svg)](https://github.com/lorenzz20105-del/droideum-termux/actions/workflows/ci.yml)
+[![version](https://img.shields.io/badge/droideum-1.3.0-blue)]()
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![platform](https://img.shields.io/badge/runs%20in-Termux%20(proot%20aarch64)-black)]()
+[![root](https://img.shields.io/badge/root-not%20required-success)]()
+
 **An Android device for AI agents — running on a stock, non-rooted phone.**
 Termux → proot-distro aarch64 Debian → QEMU full-system Android VM → MCP tool server.
 
@@ -295,6 +301,21 @@ disposable* device — good for automating your own apps, UI testing, data entry
 account, and reproducible demos. Installing apps you are not licensed to use, or using it to bypass
 another service's terms or hardware integrity checks, is not a supported use and generally won't work
 anyway (SafetyNet/Play Integrity will report an emulated, uncertified device).
+
+## Development
+
+```bash
+make check      # lint + smoke + MCP + selftest, the same thing CI runs
+make smoke      # 139 CLI assertions, stubbed QEMU/adb — no VM, completes in ~3 min
+make mcp        # 75 protocol assertions against the MCP server
+make lint       # shellcheck at info level, must be silent
+```
+
+The test suites never start a VM: `qemu-system-x86_64`, `adb` and `curl` are stubbed on `PATH`,
+so they run anywhere, including CI. `docs/RUN-LOG.md` and `docs/RUN-2-ANDROID.md` are the
+records of what happened when they *were* run against real images.
+
+Requirements: bash 4+ (Termux and every current Linux ship it; macOS ships 3.2, use `brew install bash`).
 
 ## License
 

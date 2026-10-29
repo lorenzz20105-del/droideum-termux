@@ -22,7 +22,7 @@ TERMUX_HOME="${HOME:-/data/data/com.termux/files/home}"
 DATA_DIR="$TERMUX_HOME/droideum"          # host-side, survives everything
 WRAPPER="$PREFIX/bin/droideum"
 
-c_r=$'\033[0m'; c_b=$'\033[1m'; c_g=$'\033[32m'; c_y=$'\033[33m'; c_e=$'\033[31m'; c_c=$'\033[36m'; c_d=$'\033[2m'
+c_r=$'\033[0m'; c_b=$'\033[1m'; c_g=$'\033[32m'; c_y=$'\033[33m'; c_e=$'\033[31m'; c_c=$'\033[36m'
 info() { printf '%s==>%s %s\n' "$c_c" "$c_r" "$*"; }
 ok()   { printf '%s  ok%s %s\n' "$c_g" "$c_r" "$*"; }
 warn() { printf '%s warn%s %s\n' "$c_y" "$c_r" "$*" >&2; }
@@ -55,7 +55,11 @@ export DEBIAN_FRONTEND=noninteractive
 pkg update -y >/dev/null 2>&1 || warn "pkg update had warnings (continuing)"
 for p in proot-distro curl coreutils tar; do
   if pkg list-installed 2>/dev/null | grep -q "^$p/"; then ok "$p already installed"
-  else pkg install -y "$p" >/dev/null 2>&1 && ok "$p installed" || die "could not install $p"; fi
+  elif pkg install -y "$p" >/dev/null 2>&1; then
+    ok "$p installed"
+  else
+    die "could not install $p"
+  fi
 done
 command -v proot-distro >/dev/null 2>&1 || die "proot-distro not on PATH after install"
 
