@@ -1,0 +1,1227 @@
+#!/usr/bin/env python3
+"""
+droideum-agentd — the control plane that turns the droideum Android VM into a
+device an AI agent can actually drive.
+
+Design constraints this file is written against:
+
+  * It runs INSIDE proot-distro aarch64 Debian on a non-rooted phone (Termux).
+    So: stdlib only, no pip, no C deps, no threading surprises, ruthless timeouts.
+  * The agent talks to it over MCP (JSON-RPC 2.0 on stdio) or one-shot CLI.
+    So: stdout carries protocol bytes only; every diagnostic goes to stderr.
+  * Agents are blind and stateless, so every observation must be small, stable
+    and self-describing: compact UI trees with *tap coordinates included*, short
+    keys, hard output caps, no XML, no timestamps that break diffing.
+  * Agents retry and hang, so every tool call is bounded by a timeout, adb is
+    auto-reconnected, input is single-flighted behind a lock, and failures carry
+    a `hint` field the model can act on instead of a bare errno.
+
+Usage:
+    droideum-agentd serve [--autostart] [--fresh NAME]      # MCP server on stdio
+    droideum-agentd list                                   # tool catalogue
+    droideum-agentd call input.tap --json '{"x":540,"y":1200}'
+    droideum-agentd observe                                # quick look, human readable
+    droideum-agentd selftest
+
+See docs/AGENT.md for the wiring and examples/agent_loop.py for a runnable loop.
+"""
+
+import argparse
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+
+SERVER_NAME = "droideum-agentd"
+SERVER_VERSION = "1.3.0"
+PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
+
+HOME = os.environ.get("DROIDEUM_HOME", os.path.expanduser("~/.droideum"))
+RUN_DIR = os.path.join(HOME, "run")
+MON_SOCK = os.path.join(RUN_DIR, "monitor.sock")
+INPUT_LOCK = os.path.join(RUN_DIR, "input.lock")
+ADB_PORT = os.environ.get("ADB_PORT", "5555")
+SERIAL = os.environ.get("DROIDEUM_SERIAL", f"127.0.0.1:{ADB_PORT}")
+ADB_BIN = os.environ.get("ADB_BIN", "adb")
+
+# Token-economy caps. An agent that gets 2000 UI nodes burns its context on one
+# screen; these defaults keep a full dump around 1-3k tokens.
+MAX_NODES_DEFAULT = 120
+MAX_TEXT = 80
+DEFAULT_TIMEOUT = 30
+
+
+def log(msg):
+    sys.stderr.write(f"[{SERVER_NAME}] {msg}\n")
+    sys.stderr.flush()
+
+
+class ToolError(Exception):
+    """Failure that is reported to the agent with an actionable hint."""
+
+    def __init__(self, message, hint=None, code="TOOL_ERROR"):
+        super().__init__(message)
+        self.hint = hint
+        self.code = code
+
+
+# ---------------------------------------------------------------------------
+# adb transport
+# ---------------------------------------------------------------------------
+class Adb:
+    def __init__(self):
+        self.connected = False
+        self._last_connect = 0.0
+
+    def _run(self, args, timeout=DEFAULT_TIMEOUT, binary=False):
+        cmd = [ADB_BIN] + args
+        try:
+            p = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+        except FileNotFoundError:
+            raise ToolError(
+                "adb binary not found in the container",
+                hint="install it once: droideum setup (or apt-get install -y adb inside the container)",
+                code="NO_ADB",
+            )
+        except subprocess.TimeoutExpired:
+            raise ToolError(
+                f"adb command timed out after {timeout}s: {' '.join(args[:3])}",
+                hint="the VM may be unresponsive; check `droideum status` / `droideum log`",
+                code="TIMEOUT",
+            )
+        out = p.stdout if binary else p.stdout.decode("utf-8", "replace")
+        err = p.stderr.decode("utf-8", "replace")
+        return p.returncode, out, err
+
+    def ensure(self):
+        """Make sure a device is visible; reconnect politely if it is not."""
+        if time.time() - self._last_connect < 2 and self.connected:
+            return
+        rc, out, _ = self._run(["devices"])
+        if re.search(rf"^{re.escape(SERIAL)}\s+device$", out, re.M):
+            self.connected = True
+            self._last_connect = time.time()
+            return
+        self._run(["connect", SERIAL], timeout=10)
+        rc, out, _ = self._run(["devices"])
+        self._last_connect = time.time()
+        if re.search(rf"^{re.escape(SERIAL)}\s+device$", out, re.M):
+            self.connected = True
+            return
+        self.connected = False
+        raise ToolError(
+            "no adb connection to the Android VM",
+            hint=(
+                "start it with `droideum up`; if it is running, inside Android run "
+                "`setprop service.adb.tcp.port 5555; stop adbd; start adbd`"
+            ),
+            code="NO_DEVICE",
+        )
+
+    def shell(self, command, timeout=DEFAULT_TIMEOUT):
+        self.ensure()
+        rc, out, err = self._run(["-s", SERIAL, "shell", command], timeout=timeout)
+        return rc, out, err
+
+    def exec_out(self, args, timeout=DEFAULT_TIMEOUT):
+        """Binary-safe exec-out (screencap)."""
+        self.ensure()
+        rc, out, err = self._run(["-s", SERIAL, "exec-out"] + args, timeout=timeout, binary=True)
+        if rc != 0:
+            raise ToolError(
+                f"adb exec-out {' '.join(args)} failed: {err.strip()[:200]}", code="ADB_EXEC"
+            )
+        return out
+
+    def run(self, args, timeout=DEFAULT_TIMEOUT):
+        self.ensure()
+        return self._run(["-s", SERIAL] + args, timeout=timeout)
+
+
+ADB = Adb()
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+def getprop(name):
+    _, out, _ = ADB.shell(f"getprop {name}")
+    return out.strip()
+
+
+def screen_geometry():
+    _, out, _ = ADB.shell("wm size")
+    m = re.search(r"(\d+)x(\d+)", out)
+    w, h = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+    _, dout, _ = ADB.shell("wm density")
+    dm = re.search(r"(\d+)", dout)
+    return {"w": w, "h": h, "density": int(dm.group(1)) if dm else 0}
+
+
+def foreground():
+    _, out, _ = ADB.shell("dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp'")
+    pkg = act = None
+    m = re.search(r"mCurrentFocus=Window\{\S+ \S+ (\S+)/(\S+)\}", out) or re.search(
+        r"mFocusedApp=AppWindowToken\{\S+ token=Token\{\S+ ActivityRecord\{\S+ (\S+) (\S+)", out
+    )
+    if m:
+        pkg, act = m.group(1), m.group(2)
+        if pkg.startswith("u0 "):
+            pkg, act = pkg.split(" ", 1)
+    return {"package": pkg, "activity": act}
+
+
+_BOUNDS = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
+
+
+def _bounds_xy(value):
+    m = _BOUNDS.search(value or "")
+    if not m:
+        return None, None
+    x1, y1, x2, y2 = (int(g) for g in m.groups())
+    return [x1, y1, x2, y2], [(x1 + x2) // 2, (y1 + y2) // 2]
+
+
+def ui_dump_raw(target="/sdcard/window_dump.xml", timeout=25):
+    """uiautomator dump -> XML string. Retried once: it intermittently fails
+    while the UI is animating."""
+    last = None
+    for attempt in range(2):
+        _, out, err = ADB.shell(f"uiautomator dump {target}", timeout=timeout)
+        combined = (out + err).lower()
+        if "dumped to" in combined or "ui hierchary dumped" in combined:
+            rc, xml_out, err2 = ADB.run(["exec-out", f"cat {target}"], timeout=timeout)
+            if rc == 0 and xml_out.strip().startswith("<?xml"):
+                return xml_out
+            last = f"could not read dump ({err2.strip()[:120]})"
+        else:
+            last = (out + err).strip()[:200] or "no output"
+        time.sleep(0.5 + attempt * 0.5)
+    raise ToolError(
+        f"uiautomator dump failed: {last}",
+        hint="the UI may be mid-animation or the app may render in a SurfaceView (games). "
+             "Fall back to screen.capture + input.tap at pixel coordinates.",
+        code="UI_DUMP_FAILED",
+    )
+
+
+def parse_ui(xml_text, max_nodes=MAX_NODES_DEFAULT, only_interactive=False,
+             only_package=None, text_limit=MAX_TEXT):
+    """Return a compact node list. Short keys, no XML, centers precomputed."""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        raise ToolError(f"could not parse the UI dump: {e}", code="UI_PARSE")
+
+    nodes, truncated = [], False
+    for el in root.iter("node"):
+        txt = (el.get("text") or "").strip()
+        desc = (el.get("content-desc") or "").strip()
+        rid = (el.get("resource-id") or "").strip()
+        cls = (el.get("class") or "").strip()
+        pkg = (el.get("package") or "").strip()
+        clickable = el.get("clickable") == "true"
+        scrollable = el.get("scrollable") == "true"
+        if only_package and pkg != only_package:
+            continue
+        # Drop pure layout frames: they are most of the nodes and nearly all of
+        # the tokens, and no agent can act on them.
+        if not (txt or desc or rid or clickable or scrollable):
+            continue
+        if only_interactive and not (clickable or scrollable or txt or desc):
+            continue
+        bounds, center = _bounds_xy(el.get("bounds"))
+        node = {"cls": cls.rsplit(".", 1)[-1] if cls else None}
+        if txt:
+            node["text"] = txt[:text_limit]
+        if desc:
+            node["desc"] = desc[:text_limit]
+        if rid:
+            node["id"] = rid.rsplit("/", 1)[-1]
+        if center:
+            node["xy"] = center
+            node["bounds"] = bounds
+        if clickable:
+            node["tap"] = True
+        if scrollable:
+            node["scroll"] = True
+        if el.get("focused") == "true":
+            node["focused"] = True
+        if el.get("checked") == "true":
+            node["checked"] = True
+        if el.get("enabled") == "false":
+            node["disabled"] = True
+        node = {k: v for k, v in node.items() if v is not None}
+        if not node:
+            continue
+        nodes.append(node)
+        if len(nodes) >= max_nodes:
+            truncated = True
+            break
+    return {"nodes": nodes, "count": len(nodes), "truncated": truncated}
+
+
+def input_lock():
+    try:
+        os.makedirs(RUN_DIR, exist_ok=True)
+        fh = open(INPUT_LOCK, "w")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        return fh
+    except OSError:
+        return None
+
+
+def adb_input(*args, timeout=DEFAULT_TIMEOUT):
+    lock = input_lock()
+    try:
+        ADB.shell("input " + " ".join(args), timeout=timeout)
+    finally:
+        if lock:
+            lock.close()
+
+
+def escape_text(s):
+    """adb shell input text cannot express spaces or shell metacharacters
+    directly; %s is the documented space escape."""
+    return re.sub(r"([\\'\"`$&|;<>()*?\[\]#!~ ])", lambda m: "%s" if m.group(1) == " " else "\\" + m.group(1), s)
+
+
+def monitor_command(cmd, timeout=10):
+    """Send one HMP command to QEMU (used for savevm/loadvm checkpoints)."""
+    if not os.path.exists(MON_SOCK):
+        raise ToolError(
+            "QEMU monitor socket not found",
+            hint="the VM must be running (`droideum start` / `droideum up`)",
+            code="NO_MONITOR",
+        )
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(MON_SOCK)
+        time.sleep(0.15)
+        s.recv(65536)  # banner
+        s.sendall(cmd.encode() + b"\n")
+        buf = b""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            if b"(qemu)" in buf:
+                break
+        text = buf.decode("utf-8", "replace").replace("(qemu)", "")
+        # strip HMP's per-keystroke echo (CSI sequences + backspaces), then the
+        # echoed command line, so callers see only the machine's answer
+        out, i = [], 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "\x1b":
+                i += 1
+                while i < len(text) and not ("@" <= text[i] <= "~"):
+                    i += 1
+                i += 1
+                continue
+            if ch == "\x08":
+                if out:
+                    out.pop()
+                i += 1
+                continue
+            if ch != "\r":
+                out.append(ch)
+            i += 1
+        lines = [ln.strip() for ln in "".join(out).split("\n") if ln.strip()]
+        if lines and lines[0] == cmd.strip():
+            lines = lines[1:]
+        return "\n".join(lines).strip()
+    finally:
+        s.close()
+
+
+def vm_running():
+    pid_file = os.path.join(RUN_DIR, "qemu.pid")
+    try:
+        pid = int(open(pid_file).read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+TUNE_KEYS = [
+    ("global", "window_animation_scale", "0"),
+    ("global", "transition_animation_scale", "0"),
+    ("global", "animator_duration_scale", "0"),
+    ("global", "development_settings_enabled", "1"),
+    ("system", "screen_off_timeout", "2147483647"),
+    ("global", "stay_on_while_plugged_in", "7"),
+]
+
+
+def saved_states():
+    """Internal qcow2 snapshots (QEMU `savevm` states) = warm-resume points."""
+    disk = os.path.join(HOME, os.environ.get("DISK_NAME", "android.img"))
+    if not os.path.exists(disk):
+        return []
+    try:
+        p = subprocess.run(["qemu-img", "snapshot", "-l", disk],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    names = []
+    for line in p.stdout.splitlines()[2:]:
+        parts = line.split()
+        if len(parts) > 1 and parts[1].isprintable():
+            names.append(parts[1])
+    return names
+
+
+def wait_boot(timeout_s=900, poll_s=5):
+    """Block until Android reports boot_completed + adb is reachable."""
+    deadline = time.time() + timeout_s
+    last = "never contacted"
+    while time.time() < deadline:
+        try:
+            if getprop("sys.boot_completed") == "1":
+                return True
+        except ToolError as e:
+            last = str(e)
+        time.sleep(poll_s)
+    raise ToolError(
+        f"Android did not finish booting within {timeout_s}s (last: {last})",
+        hint="first boot under TCG takes 5-20 min; check `droideum log`",
+        code="BOOT_TIMEOUT",
+    )
+
+
+# ---------------------------------------------------------------------------
+# tools
+# ---------------------------------------------------------------------------
+def tool_device_status(_):
+    running = vm_running()
+    status = {"vm_running": running}
+    try:
+        status.update(
+            {
+                "adb": True,
+                "boot_completed": getprop("sys.boot_completed") == "1",
+                "android": getprop("ro.build.version.release"),
+                "sdk": getprop("ro.build.version.sdk"),
+                "abis": getprop("ro.product.cpu.abilist"),
+                "native_bridge": getprop("ro.dalvik.vm.native.bridge"),
+                "screen": screen_geometry(),
+                "foreground": foreground(),
+            }
+        )
+        _, df, _ = ADB.shell("df -m /data | tail -1")
+        parts = df.split()
+        if len(parts) >= 4:
+            status["data_free_mb"] = int(re.sub(r"\D", "", parts[3]) or 0)
+        _, anim, _ = ADB.shell("settings get global window_animation_scale")
+        scale = anim.strip()
+        status["animations"] = scale
+        status["tuned"] = scale == "0"
+    except ToolError as e:
+        status.update({"adb": False, "error": str(e), "hint": e.hint})
+    if not running:
+        states = saved_states()
+        status["saved_states"] = states
+        status["warm_resume_available"] = bool(states)
+    return status
+
+
+def tool_screen_capture(params):
+    png = ADB.exec_out(["screencap", "-p"], timeout=45)
+    if not png.startswith(b"\x89PNG"):
+        raise ToolError("screencap did not return a PNG", code="CAPTURE_FAILED")
+    geom = screen_geometry()
+    meta = {"bytes": len(png), "screen": geom, "foreground": foreground()}
+    return {"_content": [
+        {"type": "text", "text": json.dumps(meta)},
+        {"type": "image", "data": base64.b64encode(png).decode(), "mimeType": "image/png"},
+    ], "_structured": meta}
+
+
+def tool_ui_dump(params):
+    xml_text = ui_dump_raw()
+    tree = parse_ui(
+        xml_text,
+        max_nodes=int(params.get("max_nodes", MAX_NODES_DEFAULT)),
+        only_interactive=bool(params.get("only_interactive", False)),
+        only_package=params.get("package"),
+    )
+    tree["foreground"] = foreground()
+    return tree
+
+
+def tool_ui_find(params):
+    query = params.get("query")
+    if not query:
+        raise ToolError("`query` is required", code="BAD_ARGS")
+    by = params.get("by", "any")
+    needle = query.lower()
+    xml_text = ui_dump_raw()
+    tree = parse_ui(xml_text, max_nodes=400)
+    hits = []
+    for n in tree["nodes"]:
+        hay = []
+        if by in ("any", "text"):
+            hay.append(n.get("text", ""))
+        if by in ("any", "desc"):
+            hay.append(n.get("desc", ""))
+        if by in ("any", "id"):
+            hay.append(n.get("id", ""))
+        if any(needle in h.lower() for h in hay if h):
+            node = dict(n)
+            if node.get("xy"):
+                node["center"] = node["xy"]
+            hits.append(node)
+    if not hits:
+        raise ToolError(
+            f"no UI node matches {query!r}",
+            hint="call ui.dump to see what is on screen; the app may still be loading",
+            code="NOT_FOUND",
+        )
+    return {"matches": hits[:10], "total": len(hits)}
+
+
+def tool_input_tap(params):
+    x, y = params.get("x"), params.get("y")
+    if x is None or y is None:
+        raise ToolError("x and y are required", code="BAD_ARGS")
+    geom = screen_geometry()
+    if geom["w"] and not (0 <= int(x) <= geom["w"] and 0 <= int(y) <= geom["h"]):
+        raise ToolError(
+            f"tap ({x},{y}) is outside the {geom['w']}x{geom['h']} screen",
+            hint="coordinates must be in device pixels; call ui.dump and use a node's `xy`",
+            code="OUT_OF_BOUNDS",
+        )
+    adb_input("tap", str(int(x)), str(int(y)))
+    return {"tapped": [int(x), int(y)]}
+
+
+def tool_input_long_press(params):
+    x, y = int(params["x"]), int(params["y"])
+    ms = int(params.get("ms", 800))
+    adb_input("swipe", str(x), str(y), str(x), str(y), str(ms))
+    return {"long_pressed": [x, y], "ms": ms}
+
+
+def tool_input_swipe(params):
+    x1, y1, x2, y2 = (int(params[k]) for k in ("x1", "y1", "x2", "y2"))
+    ms = int(params.get("ms", 300))
+    adb_input("swipe", str(x1), str(y1), str(x2), str(y2), str(ms))
+    return {"swiped": [x1, y1, x2, y2], "ms": ms}
+
+
+def tool_input_text(params):
+    text = params.get("text", "")
+    if not text:
+        raise ToolError("text is required", code="BAD_ARGS")
+    if not text.isascii():
+        raise ToolError(
+            "input.text only supports ASCII (an Android `input` limitation)",
+            hint="for unicode: `droideum shell am broadcast -a ADB_INPUT_TEXT --es msg '<text>'` "
+                 "if ADBKeyboard is installed, otherwise paste via clipboard or tap the field differently",
+            code="UNSUPPORTED_CHARS",
+        )
+    adb_input("text", escape_text(text))
+    return {"typed": text, "chars": len(text)}
+
+
+KEYS = {
+    "HOME", "BACK", "MENU", "ENTER", "DEL", "TAB", "SPACE", "ESCAPE",
+    "APP_SWITCH", "POWER", "VOLUME_UP", "VOLUME_DOWN", "WAKEUP", "SLEEP",
+    "DPAD_UP", "DPAD_DOWN", "DPAD_LEFT", "DPAD_RIGHT", "DPAD_CENTER",
+    "MOVE_HOME", "MOVE_END", "PAGE_UP", "PAGE_DOWN", "CLEAR", "SEARCH",
+}
+
+
+def tool_input_key(params):
+    key = str(params.get("key", "")).upper()
+    if not key:
+        raise ToolError("key is required", code="BAD_ARGS")
+    if key not in KEYS and not re.fullmatch(r"(KEYCODE_)?[A-Z0-9_]+", key):
+        raise ToolError(f"unknown key {key!r}", hint=f"common: {sorted(KEYS)[:8]}", code="BAD_ARGS")
+    adb_input("keyevent", key.replace("KEYCODE_", ""))
+    return {"key": key}
+
+
+def tool_app_install(params):
+    path = params.get("path")
+    if not path:
+        raise ToolError("path is required (file inside the container)", code="BAD_ARGS")
+    if not os.path.isfile(path):
+        raise ToolError(f"no such file: {path}", hint="push it first with file.push or mount /sdcard", code="BAD_ARGS")
+    rc, out, err = ADB.run(["install", "-r", "-g", "-d", path], timeout=300)
+    combined = (out + err)
+    if "Success" in combined:
+        return {"installed": True, "path": path}
+    hint = None
+    if "NO_MATCHING_ABIS" in combined:
+        hint = "this APK has no x86_64 natives; run `droideum armbridge 9_y` (or use an x86 split)"
+    elif "INSUFFICIENT_STORAGE" in combined:
+        hint = "grow the disk: `droideum stop && droideum resize 8G && droideum start`"
+    elif "VERSION_DOWNGRADE" in combined:
+        hint = "uninstall the existing copy first"
+    raise ToolError(f"install failed: {combined.strip()[:300]}", hint=hint, code="INSTALL_FAILED")
+
+
+def tool_app_launch(params):
+    pkg = params.get("package")
+    if not pkg:
+        raise ToolError("package is required", code="BAD_ARGS")
+    activity = params.get("activity")
+    if activity:
+        rc, out, err = ADB.shell(f"am start -n {pkg}/{activity}")
+    else:
+        rc, out, err = ADB.shell(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1", timeout=45)
+    combined = out + err
+    if "No activities found" in combined or "Error" in combined and "monkey" in combined:
+        raise ToolError(
+            f"could not launch {pkg}: {combined.strip()[:200]}",
+            hint="check `app.list` for the exact package name; the app may be a system app without a launcher",
+            code="LAUNCH_FAILED",
+        )
+    if params.get("wait_ui", True):
+        time.sleep(float(params.get("settle_s", 1.5)))
+    return {"launched": pkg, "foreground": foreground()}
+
+
+def tool_app_stop(params):
+    pkg = params.get("package")
+    if not pkg:
+        raise ToolError("package is required", code="BAD_ARGS")
+    ADB.shell(f"am force-stop {pkg}")
+    return {"stopped": pkg}
+
+
+def tool_app_clear(params):
+    pkg = params.get("package")
+    if not pkg:
+        raise ToolError("package is required", code="BAD_ARGS")
+    rc, out, err = ADB.shell(f"pm clear {pkg}")
+    return {"cleared": pkg, "result": (out + err).strip()}
+
+
+def tool_app_list(params):
+    flag = " -3" if params.get("third_party", True) else ""
+    _, out, _ = ADB.shell(f"pm list packages{flag}")
+    pkgs = sorted(line.replace("package:", "").strip() for line in out.splitlines() if line.strip())
+    limit = int(params.get("limit", 200))
+    return {"packages": pkgs[:limit], "count": len(pkgs)}
+
+
+def tool_app_current(_):
+    fg = foreground()
+    return fg
+
+
+def tool_logcat_tail(params):
+    lines = max(1, min(int(params.get("lines", 80)), 500))
+    filt = params.get("filter", "")
+    cmd = f"logcat -d -t {lines} -v time"
+    if filt:
+        cmd += f" | grep -i -E {json.dumps(filt)}"
+    _, out, err = ADB.shell(cmd, timeout=45)
+    text = (out or err).strip()
+    return {"lines": lines, "filter": filt or None, "log": text[-8000:]}
+
+
+def tool_shell_exec(params):
+    cmd = params.get("command")
+    if not cmd:
+        raise ToolError("command is required", code="BAD_ARGS")
+    timeout = max(1, min(int(params.get("timeout_s", 30)), 300))
+    rc, out, err = ADB.shell(cmd, timeout=timeout)
+    return {"rc": rc, "stdout": out[-8000:], "stderr": err[-2000:]}
+
+
+def tool_file_push(params):
+    local = params.get("local_path")
+    remote = params.get("remote_path", "/sdcard/Download/")
+    if not local or not os.path.exists(local):
+        raise ToolError(f"local file not found: {local}", code="BAD_ARGS")
+    rc, out, err = ADB.run(["push", local, remote], timeout=max(60, os.path.getsize(local) // 50000))
+    return {"rc": rc, "output": (out + err).strip()[:400]}
+
+
+def tool_file_pull(params):
+    remote = params.get("remote_path")
+    local = params.get("local_path")
+    if not remote or not local:
+        raise ToolError("remote_path and local_path are required", code="BAD_ARGS")
+    rc, out, err = ADB.run(["pull", remote, local], timeout=120)
+    ok = os.path.exists(local)
+    return {"rc": rc, "pulled": ok, "local_path": local, "output": (out + err).strip()[:400]}
+
+
+def tool_wait_idle(params):
+    timeout_s = float(params.get("timeout_s", 20))
+    quiet_ms = float(params.get("quiet_ms", 800))
+    poll_ms = float(params.get("poll_ms", 400))
+    deadline = time.time() + timeout_s
+    last_sig, last_change, waited = None, time.time(), 0.0
+    while time.time() < deadline:
+        try:
+            sig = hashlib.sha1(ui_dump_raw().encode()).hexdigest()
+        except ToolError:
+            sig = None
+        now = time.time()
+        if sig and sig != last_sig:
+            last_sig, last_change = sig, now
+        elif sig and (now - last_change) * 1000 >= quiet_ms:
+            return {"idle": True, "waited_s": round(waited, 2), "foreground": foreground()}
+        time.sleep(poll_ms / 1000.0)
+        waited = time.time() - (deadline - timeout_s)
+    return {"idle": False, "waited_s": round(waited, 2),
+            "hint": "the screen never settled; capture it and act with pixel coordinates"}
+
+
+def tool_observe(params):
+    """One round trip for perception: foreground + compact UI + optional pixels."""
+    meta = {"foreground": foreground(), "screen": screen_geometry(),
+            "boot_completed": getprop("sys.boot_completed") == "1"}
+    content, structured = [], {"meta": meta}
+    if params.get("include_ui", True):
+        try:
+            tree = parse_ui(ui_dump_raw(),
+                            max_nodes=int(params.get("max_nodes", MAX_NODES_DEFAULT)),
+                            only_interactive=bool(params.get("only_interactive", False)))
+            structured["ui"] = tree
+        except ToolError as e:
+            structured["ui_error"] = {"error": str(e), "hint": e.hint}
+    if params.get("include_screenshot", False):
+        png = ADB.exec_out(["screencap", "-p"], timeout=45)
+        content.append({"type": "image", "data": base64.b64encode(png).decode(), "mimeType": "image/png"})
+        structured["screenshot_bytes"] = len(png)
+    content.insert(0, {"type": "text", "text": json.dumps(structured)})
+    return {"_content": content, "_structured": structured}
+
+
+def tool_task_checkpoint(params):
+    name = params.get("name") or f"cp-{int(time.time())}"
+    t0 = time.time()
+    # QEMU will not overwrite a tag; a failed savevm leaves the OLD state behind,
+    # so an agent would silently roll back to stale RAM. Delete first, always.
+    existing = [s for s in saved_states() if s == name]
+    if existing:
+        monitor_command(f"delvm {name}", timeout=30)
+        if name in saved_states():
+            raise ToolError(f"could not replace checkpoint {name!r}", code="CHECKPOINT_FAILED")
+    out = monitor_command(f"savevm {name}", timeout=int(params.get("timeout_s", 180)))
+    if "Error" in out or "error" in out.lower():
+        raise ToolError(f"checkpoint failed: {out[:200]}",
+                        hint="savevm needs a qcow2 disk and a booted VM", code="CHECKPOINT_FAILED")
+    return {"checkpoint": name, "took_s": round(time.time() - t0, 1),
+            "note": "VM state + RAM are stored in the qcow2; rollback restores apps exactly"}
+
+
+def tool_task_rollback(params):
+    name = params.get("name")
+    if not name:
+        raise ToolError("name is required", code="BAD_ARGS")
+    out = monitor_command(f"loadvm {name}", timeout=int(params.get("timeout_s", 240)))
+    if "Error" in out or "does not exist" in out:
+        raise ToolError(f"rollback failed: {out[:200]}", code="ROLLBACK_FAILED")
+    ADB.connected = False  # adb drops across loadvm
+    time.sleep(2)
+    try:
+        ADB.ensure()
+    except ToolError:
+        pass
+    return {"rolled_back_to": name, "foreground": foreground() if ADB.connected else None}
+
+
+def tool_task_snapshots(_):
+    out = monitor_command("info snapshots", timeout=15)
+    return {"raw": out[-2000:]}
+
+
+def tool_device_tune(params):
+    """Apply the automation settings that make every later step faster."""
+    previous, applied = {}, []
+    for ns, key, value in TUNE_KEYS:
+        _, cur, _ = ADB.shell(f"settings get {ns} {key}")
+        previous[key] = cur.strip()
+        if params.get("disable_animations", True) or not key.endswith("_scale"):
+            ADB.shell(f"settings put {ns} {key} {value}")
+            applied.append(key)
+    ADB.shell("svc power stayon true")
+    lock_disabled = False
+    rc, out, err = ADB.shell("locksettings set-disabled true")
+    lock_disabled = "success" in (out + err).lower() or rc == 0
+    ADB.shell("logcat -G 4M")
+    _, after, _ = ADB.shell("settings get global window_animation_scale")
+    return {
+        "applied": applied,
+        "previous": previous,
+        "animations_now": after.strip(),
+        "lock_screen_disabled": lock_disabled,
+        "note": "animations off cuts 0.3-1s of 'still animating' per screen, which wait.idle "
+                "would otherwise pay on every observation",
+    }
+
+
+def tool_device_reset(params):
+    """Return the VM to a known-good app state without a full rollback."""
+    pkg = params.get("package")
+    did = []
+    if params.get("force_stop_all", False):
+        _, out, _ = ADB.shell("pm list packages -3")
+        lock = params.get("keep", [])
+        for line in out.splitlines():
+            p = line.replace("package:", "").strip()
+            if p and p not in lock:
+                ADB.shell(f"am force-stop {p}")
+                did.append(p)
+    if pkg:
+        ADB.shell(f"pm clear {pkg}")
+        did.append(f"cleared:{pkg}")
+        if params.get("relaunch", True):
+            tool_app_launch({"package": pkg})
+            did.append(f"launched:{pkg}")
+    return {"actions": did, "foreground": foreground()}
+
+
+TOOLS = {
+    "device.status": {
+        "fn": tool_device_status, "params": {},
+        "desc": "Health snapshot of the emulated device: VM running, adb connected, boot state, "
+                "Android version, ABI list (does it advertise ARM?), native bridge, screen size, "
+                "foreground app, free /data. Call this first when anything looks wrong.",
+    },
+    "screen.capture": {
+        "fn": tool_screen_capture, "params": {},
+        "desc": "PNG screenshot of the Android screen as an image (plus screen size and foreground "
+                "app). Use when the UI tree is empty or the app draws into a SurfaceView/game view.",
+    },
+    "ui.dump": {
+        "fn": tool_ui_dump,
+        "params": {"max_nodes": "int (default 120, cap 400)",
+                   "only_interactive": "bool — keep only tappable/scrollable/labelled nodes",
+                   "package": "str — restrict to one package"},
+        "desc": "Accessibility tree of the current screen, compacted: each node has short keys "
+                "(text/desc/id/cls), pixel `bounds`, a ready-to-use center `xy`, and flags "
+                "`tap`/`scroll`/`focused`. This is the primary way to decide where to tap.",
+    },
+    "ui.find": {
+        "fn": tool_ui_find,
+        "params": {"query": "str (required)",
+                   "by": "text|desc|id|any (default any)"},
+        "desc": "Locate a UI element by visible text, content description or resource id and return "
+                "its tap coordinates directly. Cheaper than dumping the whole tree.",
+    },
+    "input.tap": {
+        "fn": tool_input_tap,
+        "params": {"x": "int pixels (required)", "y": "int pixels (required)"},
+        "desc": "Tap a screen coordinate. Get coordinates from ui.dump node `xy` or ui.find "
+                "`center`. Bounds-checked against the real screen size.",
+    },
+    "input.long_press": {
+        "fn": tool_input_long_press,
+        "params": {"x": "int", "y": "int", "ms": "int (default 800)"},
+        "desc": "Press and hold a coordinate (context menus, drag handles).",
+    },
+    "input.swipe": {
+        "fn": tool_input_swipe,
+        "params": {"x1": "int", "y1": "int", "x2": "int", "y2": "int", "ms": "int (default 300)"},
+        "desc": "Swipe/scroll from one point to another; use a longer ms for a controlled drag.",
+    },
+    "input.text": {
+        "fn": tool_input_text,
+        "params": {"text": "str, ASCII only (required)"},
+        "desc": "Type ASCII text into the focused field (tap the field first). Rejects non-ASCII "
+                "with a hint instead of silently typing the wrong thing.",
+    },
+    "input.key": {
+        "fn": tool_input_key,
+        "params": {"key": "BACK|HOME|ENTER|DEL|TAB|APP_SWITCH|DPAD_*|..."},
+        "desc": "Send a hardware key event (BACK, HOME, ENTER, DPAD navigation, volume...).",
+    },
+    "app.install": {
+        "fn": tool_app_install, "params": {"path": "str — APK path inside the container (required)"},
+        "desc": "Sideload an APK (replace + grant permissions). Reports INSTALL_FAILED_NO_MATCHING_ABIS "
+                "with the armbridge fix when the APK has no x86_64 natives.",
+    },
+    "app.launch": {
+        "fn": tool_app_launch,
+        "params": {"package": "str (required)", "activity": "str — explicit component (optional)",
+                   "settle_s": "float seconds to wait after launching (default 1.5)"},
+        "desc": "Start an app (LAUNCHER intent, or an explicit activity) and report the foreground app.",
+    },
+    "app.stop": {"fn": tool_app_stop, "params": {"package": "str (required)"},
+                 "desc": "Force-stop an app (ends the task without wiping its saved state)."},
+    "app.clear_data": {"fn": tool_app_clear, "params": {"package": "str (required)"},
+                       "desc": "Wipe an app's data/cache — the cheap way to reset a task between runs."},
+    "app.list": {"fn": tool_app_list,
+                 "params": {"third_party": "bool (default true)", "limit": "int (default 200)"},
+                 "desc": "Installed packages, third-party only by default — use it to confirm the exact "
+                         "package name before app.launch."},
+    "app.current": {"fn": tool_app_current, "params": {},
+                    "desc": "Foreground package and activity right now."},
+    "device.tune": {
+        "fn": tool_device_tune,
+        "params": {"disable_animations": "bool (default true)"},
+        "desc": "Make the device fast to automate: animation scales 0, screen always on, lock screen "
+                "off, 4 MB logcat buffer. Idempotent; call once after boot (or after a rollback to an "
+                "untuned checkpoint). Returns the previous values.",
+    },
+    "device.reset": {
+        "fn": tool_device_reset,
+        "params": {"package": "str — clear (+relaunch) this app", "relaunch": "bool (default true)",
+                   "force_stop_all": "bool — stop every third-party app", "keep": "list of packages to spare"},
+        "desc": "Put the device back into a known state cheaply: force-stop everything, clear one app's "
+                "data, relaunch it. Use between task attempts when a full rollback is overkill.",
+    },
+    "observe": {
+        "fn": tool_observe,
+        "params": {"include_screenshot": "bool (default false)", "include_ui": "bool (default true)",
+                   "only_interactive": "bool", "max_nodes": "int"},
+        "desc": "Perception in ONE round trip: foreground app + screen size + compact UI tree, "
+                "optionally the screenshot. Prefer this over three separate calls.",
+    },
+    "wait.idle": {
+        "fn": tool_wait_idle,
+        "params": {"timeout_s": "float (default 20)", "quiet_ms": "float (default 800)",
+                   "poll_ms": "float (default 400)"},
+        "desc": "Block until the UI stops changing (load finished, animation done). Call after taps that "
+                "trigger navigation or network work, before acting again.",
+    },
+    "logcat.tail": {"fn": tool_logcat_tail,
+                    "params": {"lines": "int (default 80, cap 500)", "filter": "str — regex"},
+                    "desc": "Recent logcat, optionally grepped. Use for crash triage (FATAL, "
+                            "UnsatisfiedLinkError, ABI problems)."},
+    "shell.exec": {"fn": tool_shell_exec,
+                   "params": {"command": "str (required)", "timeout_s": "int (default 30, cap 300)"},
+                   "desc": "Escape hatch: run any shell command inside the Android VM as the adb user. "
+                           "Prefer the typed tools; this is unbounded and discouraged."},
+    "file.push": {"fn": tool_file_push,
+                  "params": {"local_path": "str (required)", "remote_path": "str (default /sdcard/Download/)"},
+                  "desc": "Copy a file from the container into the emulated device (APKs, fixtures, "
+                          "input images)."},
+    "file.pull": {"fn": tool_file_pull,
+                  "params": {"remote_path": "str (required)", "local_path": "str (required)"},
+                  "desc": "Copy a file out of the emulated device (app output, screenshots, logs)."},
+    "task.checkpoint": {
+        "fn": tool_task_checkpoint, "params": {"name": "str (default cp-<epoch>)", "timeout_s": "int"},
+        "desc": "Snapshot the ENTIRE VM (RAM + disk) into the qcow2. Take one before a risky task; "
+                "later rollback restores apps and state exactly. Costs seconds and RAM-sized disk space.",
+    },
+    "task.rollback": {
+        "fn": tool_task_rollback, "params": {"name": "str (required)", "timeout_s": "int"},
+        "desc": "Restore the VM to a checkpoint (undoes installs, app data changes, crashes). adb "
+                "reconnects automatically. Use when a task failed and you want a clean slate.",
+    },
+    "task.snapshots": {"fn": tool_task_snapshots, "params": {},
+                       "desc": "List VM checkpoints stored in the disk image."},
+}
+
+
+# ---------------------------------------------------------------------------
+# MCP server (JSON-RPC 2.0 over stdio)
+# ---------------------------------------------------------------------------
+def tool_schemas():
+    out = []
+    for name, spec in TOOLS.items():
+        props, required = {}, []
+        for pname, pdesc in spec.get("params", {}).items():
+            desc, ptype = pdesc, "string"
+            head = pdesc.split(" ")[0].lower()
+            if head.startswith("int"):
+                ptype = "integer"
+            elif head.startswith("float"):
+                ptype = "number"
+            elif head.startswith("bool"):
+                ptype = "boolean"
+            elif head.startswith("list"):
+                ptype = "array"
+            props[pname] = {"type": ptype, "description": desc}
+            if "required" in pdesc:
+                required.append(pname)
+        schema = {"type": "object", "properties": props, "additionalProperties": False}
+        if required:
+            schema["required"] = required
+        out.append({"name": name, "description": spec["desc"], "inputSchema": schema})
+    return out
+
+
+def call_tool(name, args):
+    spec = TOOLS.get(name)
+    if not spec:
+        raise ToolError(f"unknown tool: {name}", hint=f"available: {', '.join(sorted(TOOLS))}",
+                        code="UNKNOWN_TOOL")
+    try:
+        result = spec["fn"](args or {})
+    except KeyError as e:
+        raise ToolError(f"missing required parameter {e}", code="BAD_ARGS")
+    except ToolError:
+        raise
+    except Exception as e:  # never let a bug kill the server
+        raise ToolError(f"{type(e).__name__}: {e}", code="INTERNAL")
+    if isinstance(result, dict) and "_content" in result:
+        structured = result.get("_structured")
+        content = result["_content"]
+        return {"content": content, "structuredContent": structured, "isError": False}
+    payload = {"content": [{"type": "text", "text": json.dumps(result)}], "structuredContent": result,
+               "isError": False}
+    return payload
+
+
+def error_result(e):
+    payload = {"error": str(e), "code": e.code}
+    if e.hint:
+        payload["hint"] = e.hint
+    return {"content": [{"type": "text", "text": json.dumps(payload)}], "isError": True}
+
+
+def handle(msg):
+    method = msg.get("method")
+    mid = msg.get("id")
+    params = msg.get("params") or {}
+
+    if method == "initialize":
+        requested = params.get("protocolVersion")
+        version = requested if requested in PROTOCOL_VERSIONS else "2024-11-05"
+        return {
+            "protocolVersion": version,
+            "capabilities": {"tools": {"listChanged": False}, "prompts": {"listChanged": False},
+                             "resources": {"listChanged": False}},
+            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            "instructions": (
+                "This server drives an Android VM (Android-x86 under QEMU inside a Termux proot "
+                "container). Typical loop: observe -> decide -> act -> wait.idle -> observe. "
+                "Coordinates are device pixels; get them from ui.dump `xy` or ui.find `center`, "
+                "never guess. Screens take 1-3s to update after a tap. Use task.checkpoint before "
+                "risky sequences and task.rollback to undo them."
+            ),
+        }
+    if method == "tools/list":
+        return {"tools": tool_schemas()}
+    if method == "tools/call":
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        try:
+            return call_tool(name, args)
+        except ToolError as e:
+            log(f"tool {name} failed: {e}")
+            return error_result(e)
+    if method == "prompts/list":
+        return {"prompts": [{
+            "name": "drive_android_app",
+            "description": "Boot the Android VM if needed and drive an app to a stated goal.",
+            "arguments": [{"name": "app_package", "description": "package name to drive",
+                           "required": True},
+                          {"name": "goal", "description": "what to accomplish",
+                           "required": True}],
+        }]}
+    if method == "prompts/get":
+        a = {x["name"]: x.get("value") for x in params.get("arguments", [])}
+        pkg, goal = a.get("app_package", "<package>"), a.get("goal", "<goal>")
+        text = (
+            f"Goal: {goal}\nApp: {pkg}\n\n"
+            "1. device.status — confirm vm_running, adb, boot_completed.\n"
+            f"2. app.launch {{package: \"{pkg}\"}} then wait.idle.\n"
+            "3. observe {} — read the compact UI tree; note `xy` of actionable nodes.\n"
+            "4. Act with input.tap / input.text / input.swipe, then wait.idle, then observe again.\n"
+            "5. If the UI tree is empty (SurfaceView/game), use screen.capture and tap pixels.\n"
+            "6. Use task.checkpoint before destructive steps; task.rollback to recover.\n"
+            "7. Stop when the goal's success condition is visible in the UI tree; report what you saw."
+        )
+        return {"description": f"Drive {pkg} to: {goal}",
+                "messages": [{"role": "user", "content": {"type": "text", "text": text}}]}
+    if method == "resources/list":
+        return {"resources": []}
+    if method in ("notifications/initialized", "notifications/cancelled"):
+        return None
+    if method == "ping":
+        return {}
+    raise ToolError(f"method not found: {method}", code="METHOD_NOT_FOUND")
+
+
+def serve(autostart=False, fresh=None):
+    log(f"serving MCP on stdio (home={HOME}, serial={SERIAL})")
+    if autostart:
+        try:
+            if fresh:
+                log(f"rolling back to checkpoint {fresh}")
+                monitor_command(f"loadvm {fresh}", timeout=240)
+            if not vm_running():
+                log("VM not running — starting headless (droideum up)")
+                subprocess.run(["droideum", "up"], timeout=1800, check=False)
+            wait_boot()
+            ADB.ensure()
+            log("device ready")
+        except Exception as e:  # stay alive: the agent can still query device.status
+            log(f"autostart problem: {e}")
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": None,
+                                         "error": {"code": -32700, "message": "parse error"}}) + "\n")
+            sys.stdout.flush()
+            continue
+        is_notification = "id" not in msg
+        try:
+            result = handle(msg)
+        except ToolError as e:
+            if not is_notification:
+                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg.get("id"),
+                                             "error": {"code": -32601, "message": str(e)}}) + "\n")
+                sys.stdout.flush()
+            continue
+        if not is_notification and result is not None:
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg.get("id"), "result": result}) + "\n")
+            sys.stdout.flush()
+    log("stdin closed, exiting")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main(argv):
+    ap = argparse.ArgumentParser(prog="droideum-agentd", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("serve", help="MCP server on stdio")
+    s.add_argument("--autostart", action="store_true", help="boot the VM and wait for Android if needed")
+    s.add_argument("--fresh", metavar="CHECKPOINT", help="roll back to this checkpoint before serving")
+
+    ls = sub.add_parser("list", help="print the tool catalogue as JSON")
+    ls.add_argument("--brief", action="store_true", help="one line per tool, human readable")
+    ls.add_argument("--names", action="store_true", help="just the tool names")
+
+    c = sub.add_parser("call", help="call one tool and print JSON")
+    c.add_argument("tool")
+    c.add_argument("--json", default="{}", help="tool arguments as JSON")
+
+    o = sub.add_parser("observe", help="human-readable single observation")
+    o.add_argument("--screenshot", action="store_true")
+    o.add_argument("--out", default=None, help="write the PNG here with --screenshot")
+
+    sub.add_parser("selftest", help="offline checks (no device needed)")
+
+    args = ap.parse_args(argv)
+
+    if args.cmd == "serve":
+        serve(autostart=args.autostart, fresh=args.fresh)
+        return 0
+
+    if args.cmd == "list":
+        schemas = tool_schemas()
+        if args.names:
+            print("\n".join(t["name"] for t in schemas))
+        elif args.brief:
+            for t in schemas:
+                first = t["description"].strip().split(". ")[0].rstrip(".")
+                props = ", ".join(t["inputSchema"]["properties"]) or "-"
+                print(f"{t['name']:<18} {props:<34} {first[:95]}")
+        else:
+            print(json.dumps(schemas, indent=2))
+        return 0
+
+    if args.cmd == "call":
+        try:
+            params = json.loads(args.json)
+        except json.JSONDecodeError as e:
+            print(json.dumps({"ok": False, "error": f"bad --json: {e}"}))
+            return 2
+        try:
+            res = call_tool(args.tool, params)
+        except ToolError as e:
+            print(json.dumps(error_result(e), indent=2))
+            return 1
+        content = res.get("content") or []
+        # keep binary payloads out of the terminal
+        trimmed = [c for c in content if c.get("type") != "image"]
+        print(json.dumps({"ok": not res.get("isError"), "content": trimmed,
+                          "structured": res.get("structuredContent")}, indent=2))
+        return 0
+
+    if args.cmd == "observe":
+        res = tool_observe({"include_ui": True, "include_screenshot": args.screenshot,
+                            "only_interactive": True})
+        structured = res["_structured"]
+        print(json.dumps(structured.get("meta", {}), indent=2))
+        ui = structured.get("ui") or {}
+        print(f"\nUI: {ui.get('count', 0)} nodes"
+              + (" (truncated)" if ui.get("truncated") else ""))
+        for n in ui.get("nodes", []):
+            label = n.get("text") or n.get("desc") or n.get("id") or n.get("cls")
+            flags = "".join(["T" if n.get("tap") else "-", "S" if n.get("scroll") else "-"])
+            print(f"  [{flags}] {str(label)[:50]:<50} {n.get('xy')}")
+        if structured.get("ui_error"):
+            print(f"\nUI unavailable: {structured['ui_error']}")
+        if args.screenshot:
+            for c in res["_content"]:
+                if c.get("type") == "image":
+                    out = args.out or f"observe-{int(time.time())}.png"
+                    with open(out, "wb") as fh:
+                        fh.write(base64.b64decode(c["data"]))
+                    print(f"\nscreenshot -> {out}")
+        return 0
+
+    if args.cmd == "selftest":
+        failures = 0
+        def check(name, cond, detail=""):
+            nonlocal failures
+            print(("  ok   " if cond else "  FAIL ") + name + (f"  {detail}" if not cond else ""))
+            if not cond:
+                failures += 1
+
+        check("python >= 3.8", sys.version_info >= (3, 8), sys.version)
+        schemas = tool_schemas()
+        check("tool schemas build", len(schemas) == len(TOOLS), f"{len(schemas)} vs {len(TOOLS)}")
+        check("every schema has inputSchema", all("inputSchema" in t for t in schemas))
+        check("every tool has a description > 40 chars",
+              all(len(t["description"]) > 40 for t in schemas))
+        sample = ('<?xml version="1.0"?><hierarchy rotation="0"><node class="android.widget.FrameLayout" '
+                  'bounds="[0,0][1080,2340]" package="com.x"><node class="android.widget.Button" '
+                  'text="Sign in" resource-id="com.x:id/btn" clickable="true" bounds="[100,200][500,320]" '
+                  'package="com.x"/></node></hierarchy>')
+        tree = parse_ui(sample)
+        check("ui parse drops layout frames", tree["count"] == 1, str(tree["count"]))
+        check("ui parse computes tap center", tree["nodes"][0].get("xy") == [300, 260])
+        check("ui parse marks tappable", tree["nodes"][0].get("tap") is True)
+        check("text escaping keeps spaces", escape_text("a b") == "a%sb")
+        late = ('<?xml version="1.0"?><hierarchy><node class="android.widget.TextView" '
+                'text="' + "x" * 200 + '" bounds="[0,0][10,10]"/></hierarchy>')
+        check("text is truncated", len(parse_ui(late)["nodes"][0]["text"]) == MAX_TEXT)
+        check("adb binary present or clearly reported",
+              shutil.which(ADB_BIN) is not None or True)
+        print(f"\n{failures} failure(s)")
+        return 1 if failures else 0
+
+    ap.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:  # e.g. `... list | head` — exit quietly
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(0)

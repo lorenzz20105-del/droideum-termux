@@ -1,0 +1,35 @@
+Measured inside the real Android-x86 9.0-r2 guest (host: 2 GB RAM, 2 cores, no KVM)
+Transcript: evidence/console-transcript.log    Screens: evidence/shots/
+
+--- identity, from the guest serial root shell -------------------------------
+getprop ro.build.version.release   -> 9
+getprop ro.product.cpu.abilist     -> x86_64,x86,armeabi-v7a,armeabi
+getprop init.svc.zygote            -> running
+getprop init.svc.adbd              -> running
+getprop sys.boot_completed         -> (empty: framework never finished)
+getprop init.svc.bootanim          -> running
+
+--- memory available to the guest --------------------------------------------
+MemTotal:      751492 kB
+MemFree:        79136 kB   (after force-stopping Chrome + GMS)
+MemAvailable: 357848 kB
+
+--- why pm install died ------------------------------------------------------
+cmd: Failure calling service package: Broken pipe (32)
+
+[ 1226.732034] libprocessgroup: Successfully killed process cgroup uid 0 pid 1144 in 467ms
+[ 1226.920914] libprocessgroup: Successfully killed process cgroup uid 1041 pid 1160 in 150ms
+[ 1227.852522] libprocessgroup: Successfully killed process cgroup uid 1047 pid 1166 in 764ms
+
+pid 1144 was zygote64; when it dies the package service goes with it. Android 9 needs
+>= 1536 MB of guest RAM. 768 MB is what fit under this host's 1982 MB.
+
+--- APK delivery, verified -----------------------------------------------
+mount -t vfat /dev/block/sdb1 /mnt/apk
+-rwx------ 1 root shell 12569951 2026-10-28 10:54 fdroid.apk
+      (org.fdroid.fdroid_2000052.apk, F-Droid 1.20.0, has lib/x86_64)
+
+--- networking ------------------------------------------------------------
+ifconfig eth0        -> No such device       (guest only has wlan0/lo/sit0/ip6tnl0)
+busybox wget http://10.0.2.2:8080/... -> Network is unreachable
+netstat: :::5555 LISTEN 1431/adbd, yet `adb devices` stays "offline" (never "unauthorized")

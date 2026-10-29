@@ -1,0 +1,28 @@
+{
+  "_comment": "Paste into your MCP client config. `droideum agent config claude|codex` prints these too.",
+  "mcpServers": {
+    "droideum-android": {
+      "command": "droideum",
+      "args": ["agent", "serve", "--autostart"],
+      "env": {
+        "DROIDEUM_HOME": "/root/.droideum",
+        "ADB_PORT": "5555"
+      }
+    }
+  },
+  "_variants": {
+    "fresh_session_each_launch": {
+      "command": "droideum",
+      "args": ["agent", "serve", "--autostart", "--fresh", "golden"]
+    },
+    "no_autostart_attach_to_running_vm": {
+      "command": "droideum",
+      "args": ["agent", "serve"]
+    },
+    "second_parallel_agent": {
+      "command": "droideum",
+      "args": ["agent", "serve", "--autostart"],
+      "env": { "DROIDEUM_HOME": "/root/.droideum2", "ADB_PORT": "5556" }
+    }
+  }
+}

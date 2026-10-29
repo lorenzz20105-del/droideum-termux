@@ -1,0 +1,11 @@
+# runtime state, never commit
+*.img
+*.qcow2
+*.iso
+.run/
+*.log
+!docs/*.md
+__pycache__/
+*.pyc
+cache/
+snapshots/
