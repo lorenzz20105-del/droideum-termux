@@ -115,10 +115,29 @@ STUB_ADB = textwrap.dedent('''\
         print("Override density: 440")
     elif "mCurrentFocus" in joined:
         print("  mCurrentFocus=Window{1a2b3c u0 com.example.app/com.example.app.MainActivity}")
+    elif "uiautomator dump" in joined and "cat " in joined:
+        scroll_flag = os.path.join(os.environ.get("DROIDEUM_HOME", ""), "scrolled")
+        extra = ""
+        if os.path.exists(scroll_flag):
+            extra = '<node class="android.widget.Button" package="com.example.app" text="Advanced settings" bounds="[60,1800][1020,1920]" clickable="true" />'
+        print("UI hierchary dumped to: /sdcard/window_dump.xml")
+        print(UI.replace("</hierarchy>", extra + "</hierarchy>"))
     elif "uiautomator dump" in joined:
         print("UI hierchary dumped to: /sdcard/window_dump.xml")
     elif "exec-out cat" in joined:
         print(UI)
+    elif "dumpsys package " in joined:
+        print("  requested permissions:\\n    android.permission.CAMERA\\n    android.permission.ACCESS_FINE_LOCATION")
+        print("  runtime permissions:\\n    android.permission.CAMERA: granted=false\\n    android.permission.ACCESS_FINE_LOCATION: granted=true")
+    elif "pm grant " in joined or "pm revoke " in joined:
+        pass
+    elif "dumpsys notification" in joined:
+        print("  NotificationRecord(0x1234: pkg=com.example.auth user=UserHandle{0})")
+        print("    extras={android.title=String (Login Code), android.text=String (Your OTP is 849201)}")
+    elif "service call notification" in joined:
+        print("Result: Parcel(00000000    '....')")
+    elif " push " in joined:
+        print("1 file pushed.")
     elif "exec-out screencap" in joined:
         sys.stdout.buffer.write(base64.b64decode(
             b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="))
@@ -156,7 +175,10 @@ STUB_ADB = textwrap.dedent('''\
     elif "df -m /data" in joined:
         print("/dev/block/dm-2 16000 4000 12000 25% /data")
     elif "input " in joined:
-        pass
+        if "input swipe" in joined:
+            scroll_flag = os.path.join(os.environ.get("DROIDEUM_HOME", ""), "scrolled")
+            if scroll_flag:
+                open(scroll_flag, "w").write("1")
     elif "monkey" in joined:
         print("Events injected: 1")
     else:
@@ -177,10 +199,11 @@ def offline_tests():
     c.rpc("notifications/initialized", notify=True)
     tools = c.rpc("tools/list")["result"]["tools"]
     names = [t["name"] for t in tools]
-    check("tools/list returns all 30 tools", len(tools) == 30, str(len(tools)))
+    check("tools/list returns all 34 tools", len(tools) == 34, str(len(tools)))
     for expected in ("observe", "ui.dump", "ui.find", "ui.wait_for", "ui.tap_match",
-                     "input.tap", "input.text", "app.launch", "app.intent",
-                     "device.clipboard", "wait.idle", "task.checkpoint", "task.rollback"):
+                     "ui.scroll_to", "input.tap", "input.text", "app.launch", "app.intent",
+                     "app.permissions", "device.clipboard", "device.notifications",
+                     "action.batch", "wait.idle", "task.checkpoint", "task.rollback"):
         check(f"tool present: {expected}", expected in names)
     schemas_ok = all(t["inputSchema"]["type"] == "object" for t in tools)
     check("all inputSchemas are objects", schemas_ok)
@@ -193,7 +216,8 @@ def offline_tests():
     check("all array properties define items schema", arrays_ok)
     tap = next(t for t in tools if t["name"] == "input.tap")
     check("input.tap x is integer", tap["inputSchema"]["properties"]["x"]["type"] == "integer")
-    check("input.tap requires x,y", set(tap["inputSchema"].get("required", [])) == {"x", "y"})
+    check("input.tap ref is integer", tap["inputSchema"]["properties"]["ref"]["type"] == "integer")
+    check("input.tap allows ref or x,y", set(tap["inputSchema"].get("required", [])) == set())
     lp = next(t for t in tools if t["name"] == "input.long_press")
     sw = next(t for t in tools if t["name"] == "input.swipe")
     check("input.long_press requires x,y", set(lp["inputSchema"].get("required", [])) == {"x", "y"})
@@ -202,8 +226,8 @@ def offline_tests():
 
     resources = c.rpc("resources/list")["result"]["resources"]
     r_uris = {r["uri"] for r in resources}
-    check("resources/list exposes live resources",
-          {"droideum://status", "droideum://ui", "droideum://logcat"} <= r_uris)
+    check("resources/list exposes all 4 live resources",
+          {"droideum://status", "droideum://ui", "droideum://notifications", "droideum://logcat"} <= r_uris)
 
     # Verify examples/agent_loop.py produces strict OpenAI-compatible function names
     import importlib.util
@@ -311,7 +335,7 @@ def stub_tests():
     check("continue button has tap coords", cont["xy"] == [540, 540], str(cont.get("xy")))
     check("continue button flagged tappable", cont.get("tap") is True)
     check("nodes carry short keys only",
-          all(set(n) <= {"cls", "text", "desc", "id", "xy", "bounds", "tap", "scroll",
+          all(set(n) <= {"ref", "cls", "text", "desc", "id", "xy", "bounds", "tap", "scroll",
                          "focused", "checked", "disabled"} for n in ui["nodes"]))
     check("no layout frames in dump", all(n.get("cls") != "FrameLayout" for n in ui["nodes"]))
 
@@ -419,19 +443,80 @@ def stub_tests():
           and uni_ok["result"]["structuredContent"]["submitted"] is True)
     check("unicode broadcast sent as ADB_INPUT_B64", "ADB_INPUT_B64" in open(calls).read())
 
-    # v1.4.0: split APK bundle (.apks) installation with ABI filtering
+    # v1.4.0/1.5.0: split APK/XAPK bundle installation with ABI matching + OBB push
     import zipfile
-    bundle_path = os.path.join(tmp, "sample.apks")
+    bundle_path = os.path.join(tmp, "sample.xapk")
     with zipfile.ZipFile(bundle_path, "w") as zf:
         zf.writestr("base.apk", b"BASE")
         zf.writestr("split_config.arm64_v8a.apk", b"ARM64")
         zf.writestr("split_config.x86_64.apk", b"X86_64")
+        zf.writestr("Android/obb/com.example.app/main.1.com.example.app.obb", b"OBB")
     inst = c.rpc("tools/call", {"name": "app.install", "arguments": {"path": bundle_path}})
-    check("app.install installs split .apks bundle (2 splits kept, arm64 filtered)",
+    check("app.install installs .xapk (matches guest x86_64 ABI + pushes OBB)",
           inst["result"]["isError"] is False
-          and inst["result"]["structuredContent"].get("splits") == 2)
+          and inst["result"]["structuredContent"].get("splits") == 2
+          and inst["result"]["structuredContent"].get("selected_abi") == "x86_64"
+          and inst["result"]["structuredContent"].get("obb_pushed") == 1)
 
-    # v1.4.0: app.intent & device.clipboard & resources/read
+    # v1.5.0: ref-based input.tap & input.text
+    dump_nodes = c.rpc("tools/call", {"name": "ui.dump", "arguments": {}})["result"]["structuredContent"]["nodes"]
+    cont_ref = next(n["ref"] for n in dump_nodes if n.get("text") == "Continue")
+    email_ref = next(n["ref"] for n in dump_nodes if n.get("desc") == "Email address")
+    tap_ref = c.rpc("tools/call", {"name": "input.tap", "arguments": {"ref": cont_ref}})
+    check("input.tap by ref taps element center",
+          tap_ref["result"]["isError"] is False
+          and tap_ref["result"]["structuredContent"]["tapped"] == [540, 540]
+          and tap_ref["result"]["structuredContent"]["ref"] == cont_ref)
+    txt_ref = c.rpc("tools/call", {"name": "input.text",
+                                   "arguments": {"ref": email_ref, "text": "hello", "clear_first": True}})
+    check("input.text with ref focuses field before typing",
+          txt_ref["result"]["isError"] is False
+          and txt_ref["result"]["structuredContent"].get("focused_ref") == email_ref)
+
+    # v1.5.0: ui.scroll_to reveals off-screen element after swiping
+    sc_file = os.path.join(tmp, "scrolled")
+    if os.path.exists(sc_file):
+        os.remove(sc_file)
+    scr = c.rpc("tools/call", {"name": "ui.scroll_to",
+                               "arguments": {"query": "Advanced settings", "tap": True, "settle_s": 0.05}})
+    check("ui.scroll_to scrolls until off-screen element appears and taps it",
+          scr["result"]["isError"] is False
+          and scr["result"]["structuredContent"]["swipes"] == 1
+          and scr["result"]["structuredContent"]["tapped"] == [540, 1860])
+
+    # v1.5.0: app.permissions, device.notifications, action.batch
+    perms = c.rpc("tools/call", {"name": "app.permissions",
+                                 "arguments": {"package": "com.example.app", "action": "grant_all"}})
+    check("app.permissions grant_all grants ungranted runtime permissions",
+          perms["result"]["isError"] is False
+          and perms["result"]["structuredContent"]["granted"] == ["android.permission.CAMERA"])
+
+    notifs = c.rpc("tools/call", {"name": "device.notifications", "arguments": {"action": "list"}})
+    check("device.notifications extracts active OTP notification",
+          notifs["result"]["isError"] is False
+          and "849201" in notifs["result"]["structuredContent"]["notifications"][0]["text"])
+
+    batch = c.rpc("tools/call", {
+        "name": "action.batch",
+        "arguments": {
+            "steps": [
+                {"tool": "input.tap", "args": {"ref": cont_ref}},
+                {"tool": "input.key", "args": {"key": "HOME"}},
+            ],
+            "observe_after": True,
+        },
+    })
+    check("action.batch executes multi-step sequence + final observation",
+          batch["result"]["isError"] is False
+          and batch["result"]["structuredContent"]["completed"] == 2
+          and "observation" in batch["result"]["structuredContent"])
+    nested = c.rpc("tools/call", {
+        "name": "action.batch",
+        "arguments": {"steps": [{"tool": "action.batch", "args": {"steps": []}}]},
+    })
+    check("action.batch rejects nested recursion", nested["result"]["isError"] is True)
+
+    # v1.4.0/1.5.0: app.intent & device.clipboard (set/get/paste) & resources/read
     intent_res = c.rpc("tools/call", {"name": "app.intent",
                                       "arguments": {"uri": "https://example.com", "settle_s": 0.05}})
     check("app.intent dispatches VIEW intent",
@@ -440,16 +525,20 @@ def stub_tests():
     clip_set = c.rpc("tools/call", {"name": "device.clipboard",
                                     "arguments": {"action": "set", "text": "otp-482910"}})
     clip_get = c.rpc("tools/call", {"name": "device.clipboard", "arguments": {"action": "get"}})
-    check("device.clipboard set+get round-trip",
+    clip_paste = c.rpc("tools/call", {"name": "device.clipboard", "arguments": {"action": "paste"}})
+    check("device.clipboard set+get+paste round-trip",
           clip_set["result"]["isError"] is False
-          and clip_get["result"]["structuredContent"].get("text") == "otp-482910")
+          and clip_get["result"]["structuredContent"].get("text") == "otp-482910"
+          and clip_paste["result"]["isError"] is False)
 
     res_status = c.rpc("resources/read", {"uri": "droideum://status"})
     res_ui = c.rpc("resources/read", {"uri": "droideum://ui"})
+    res_notif = c.rpc("resources/read", {"uri": "droideum://notifications"})
     res_log = c.rpc("resources/read", {"uri": "droideum://logcat"})
-    check("resources/read serves status, ui, and logcat",
+    check("resources/read serves status, ui, notifications, and logcat",
           json.loads(res_status["result"]["contents"][0]["text"])["adb"] is True
           and json.loads(res_ui["result"]["contents"][0]["text"])["count"] >= 3
+          and "849201" in res_notif["result"]["contents"][0]["text"]
           and "Displayed com.example.app" in res_log["result"]["contents"][0]["text"])
 
     c.close()

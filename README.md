@@ -1,7 +1,7 @@
 # droideum
 
 [![ci](https://github.com/lorenzz20105-del/droideum-termux/actions/workflows/ci.yml/badge.svg)](https://github.com/lorenzz20105-del/droideum-termux/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/droideum-1.4.0-blue)]()
+[![version](https://img.shields.io/badge/droideum-1.5.0-blue)]()
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platform](https://img.shields.io/badge/runs%20in-Termux%20(proot%20aarch64)-black)]()
 [![root](https://img.shields.io/badge/root-not%20required-success)]()
@@ -14,7 +14,7 @@ user, installs APKs, reads logcat, and can checkpoint/rollback the whole device 
 
 ```
 your agent ──MCP stdio──▶ droideum-agentd ──adb──▶ Android 9 VM (QEMU/TCG)
-                          30 tools + 3 resources      inside proot aarch64
+                          34 tools + 4 resources      inside proot aarch64
 ```
 
 ---
@@ -163,30 +163,33 @@ latency, the other two stop the qcow2 from growing forever as apps are installed
 
 ---
 
-## Agent tools (30) + MCP resources (3)
+## Agent tools (34) + MCP resources (4)
 
-Perception first — every observation is small, stable and self-describing, with `ui_hash` and
-`screen_changed` delta flags so the model immediately knows whether an action changed the screen.
+Perception first — every observation is small, stable and self-describing, with numbered `ref` IDs,
+`ui_hash`, and `screen_changed` delta flags so the model can act by `ref` without coordinate math and
+immediately knows whether an action changed the screen.
 
 | Tool | What the agent uses it for |
 |---|---|
 | `device.status` | VM/adb/boot state, Android version, ABI list, screen, foreground app, free space |
-| `observe` | **one round trip**: foreground + compact UI tree + `screen_changed` (+ optional PNG) |
-| `ui.dump` | full compact tree; layout frames dropped, `xy` tap centres precomputed, `ui_hash` |
+| `observe` | **one round trip**: foreground + compact UI tree (`ref` IDs + `xy`) + `screen_changed` (+ optional PNG) |
+| `ui.dump` | full compact tree; layout frames dropped, `ref` IDs + `xy` tap centres precomputed, `ui_hash` |
 | `ui.find` | text/desc/id → tap coordinates (≈10× cheaper than a dump) |
 | `ui.tap_match` | **one-step find + tap**: waits up to `wait_s` for text/desc/id and taps its centre |
+| `ui.scroll_to` | **auto-scroll reveal**: scrolls a list/screen until `query` appears (and optionally taps it) |
 | `ui.wait_for` | block until a specific UI node appears (or disappears when `gone=true`) |
-| `screen.capture` | PNG for vision models when the tree is empty (games, SurfaceViews) |
-| `input.tap` / `long_press` / `swipe` / `text` / `key` | act on the device, bounds-checked, single-flighted (`text` supports `clear_first`, `submit`, and Unicode via `ADBKeyboard`) |
+| `screen.capture` | PNG screenshot (falls back to QEMU monitor `screendump` PPM→PNG even if `adb` is offline) |
+| `input.tap` / `long_press` / `swipe` / `text` / `key` | act by `ref` ID or pixel coords (`text` supports `ref` focus, `clear_first`, `submit`, and `ADBKeyboard` Unicode) |
+| `action.batch` | run multiple sequential `{tool, args}` steps + optional `observe_after` in ONE MCP round-trip |
 | `wait.idle` | block until the UI stops changing — replaces brittle sleeps |
-| `app.install` / `launch` / `intent` / `stop` / `clear_data` / `list` / `current` | app lifecycle, split bundles (`.apks`/`.xapk`/`.apkm`), and deep-link/URL `Intent` dispatch |
-| `device.tune` / `clipboard` | animations off + TCG fast-dexopt; read/set Android clipboard |
+| `app.install` / `launch` / `intent` / `permissions` / `stop` / `clear_data` / `list` / `current` | app lifecycle, ABI-matched `.apks`/`.xapk` + `.obb` push, `Intent` deep links, and `grant_all` permissions |
+| `device.tune` / `clipboard` / `notifications` | TCG fast-dexopt + animations off; clipboard `get`/`set`/`paste` (Android 9+); read OTP/push notifications |
 | `device.reset` | known-good state cheaply: force-stop all, clear one app, relaunch |
 | `task.checkpoint` / `rollback` / `snapshots` | save/restore **RAM + disk** (QEMU `savevm`) |
 | `logcat.tail`, `shell.exec`, `file.push`/`pull` | triage, escape hatch, artifacts in/out |
 
-Live MCP resources (`resources/list` & `resources/read`): `droideum://status`, `droideum://ui`, and
-`droideum://logcat`.
+Live MCP resources (`resources/list` & `resources/read`): `droideum://status`, `droideum://ui`,
+`droideum://notifications`, and `droideum://logcat`.
 
 Design notes that matter for agent reliability:
 
@@ -220,7 +223,8 @@ The proot container is a normal aarch64 Debian, so it doubles as an APK workbenc
 know whether an APK will ever run here:
 
 ```bash
-droideum lab install
+droideum lab inspect app.apk   # instant pure-Python binary manifest + ABI + armbridge check (no Java!)
+droideum lab install           # optional heavy toolchain (apktool / aapt / openjdk)
 droideum lab abis app.apk      # lib/x86_64 -> runs; lib/arm64-v8a only -> needs armbridge; none -> pure Java
 droideum lab info app.apk      # package, version, target SDK
 droideum lab decode app.apk    # smali + resources

@@ -80,10 +80,15 @@ Agents pay for tokens and lose accuracy on noise. `ui.dump` therefore:
 - returns `foreground` inline, so one call answers "where am I?"
 
 `ui.find` is the cheaper path: ask for `"Sign in"` and get `center: [540,540]` back, no tree. Even
-better, `ui.tap_match` combines `ui.find` + `input.tap` (with a short wait for loading screens) into a
-single round-trip, and `ui.wait_for` blocks until a target element appears (or disappears when
-`gone: true`, e.g. waiting for a `"Loading…"` spinner to clear). Every `ui.dump` and `observe` also
-returns `ui_hash` and `screen_changed` (`true`/`false`), so the model detects no-op taps immediately.
+better:
+- Every node in `observe` / `ui.dump` carries a compact integer `ref` (`1..N`) persisted in memory and
+  `$RUN_DIR/last_ui_refs.json`, so `input.tap {"ref": 3}` and `input.text {"ref": 2, "text": "...", "submit": true}`
+  act without any coordinate math.
+- `ui.tap_match` combines `ui.find` + `input.tap` (with a short wait for loading screens), `ui.scroll_to`
+  scrolls inside scrollable lists until off-screen items appear, and `action.batch` runs multi-field form
+  sequences in a single MCP round-trip.
+- Every `ui.dump` and `observe` returns `ui_hash` and `screen_changed` (`true`/`false`), so the model
+  detects no-op taps immediately.
 
 When the tree is useless (games, Flutter/Unity SurfaceViews, DRM surfaces) the fallback is explicit:
 `screen.capture` returns a real PNG (MCP image content) for a vision model, and coordinates are tapped
@@ -182,9 +187,9 @@ Rules of thumb that keep an agent loop cheap:
 ## 7. Self-checks you can run on the phone
 
 ```bash
-droideum agent selftest        # parsers, schemas, escaping — no device needed
+droideum agent selftest        # parsers, schemas, PPM->PNG, escaping — no device needed
 python3 test/mcp-test.py       # offline MCP contract + strict JSON Schema checks
-STUB_ADB=1 python3 test/mcp-test.py   # 99 assertions: full stubbed 30-tool + resource loop
+STUB_ADB=1 python3 test/mcp-test.py   # 111 assertions: full stubbed 34-tool + 4-resource loop
 ```
 
 The stub test proves the loop end to end offline: a fake `adb` returns a canned accessibility dump, and

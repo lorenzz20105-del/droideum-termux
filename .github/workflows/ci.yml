@@ -17,8 +17,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck mtools qemu-utils
 
-      - name: shellcheck
-        run: shellcheck -S info bin/droideum install.sh test/smoke-test.sh
+      - name: shellcheck + python syntax
+        run: |
+          shellcheck -S info bin/droideum install.sh test/smoke-test.sh
+          python3 -m py_compile bin/droideum-agentd examples/agent_loop.py test/mcp-test.py
 
       - name: smoke tests (CLI, stubbed QEMU/adb — no VM needed)
         run: bash test/smoke-test.sh
@@ -29,5 +31,9 @@ jobs:
       - name: agent server selftest
         run: ./bin/droideum-agentd selftest
 
-      - name: version
-        run: ./bin/droideum --version
+      - name: version sync
+        run: |
+          v1=$(./bin/droideum --version | awk '{print $2}')
+          v2=$(./bin/droideum-agentd --version | awk '{print $2}')
+          echo "droideum=$v1 droideum-agentd=$v2"
+          test "$v1" = "$v2"

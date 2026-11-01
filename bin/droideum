@@ -19,7 +19,7 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
   exit 1
 fi
 
-DROIDEUM_VERSION="1.4.0"
+DROIDEUM_VERSION="1.5.0"
 
 # Capture caller-supplied environment overrides BEFORE setting built-in defaults;
 # otherwise bash sees `${VAR:-default}` as `+set` and silently clobbers every
@@ -670,21 +670,76 @@ _report_install_error() {
   esac
 }
 
+# Convert a binary P6 PPM file (from QEMU HMP `screendump`) into a valid PNG
+# using only Python's standard library (`struct` + `zlib`).
+_ppm_to_png() {
+  local ppm="$1" png="$2"
+  python3 - "$ppm" "$png" <<'PYEOF'
+import struct, sys, zlib
+
+ppm_path, png_path = sys.argv[1], sys.argv[2]
+with open(ppm_path, "rb") as fh:
+    data = fh.read()
+
+idx = 0
+tokens = []
+while len(tokens) < 4 and idx < len(data):
+    while idx < len(data) and data[idx] in b" \t\r\n":
+        idx += 1
+    if idx < len(data) and data[idx] == ord("#"):
+        while idx < len(data) and data[idx] != ord("\n"):
+            idx += 1
+        continue
+    start = idx
+    while idx < len(data) and data[idx] not in b" \t\r\n#":
+        idx += 1
+    if idx > start:
+        tokens.append(data[start:idx].decode("ascii"))
+
+if len(tokens) < 4 or tokens[0] != "P6":
+    sys.exit("unsupported screendump format (expected binary P6 PPM)")
+w, h, maxval = int(tokens[1]), int(tokens[2]), int(tokens[3])
+if maxval != 255:
+    sys.exit(f"unsupported PPM maxval {maxval}")
+idx += 1  # single whitespace byte after maxval
+pixels = memoryview(data)[idx : idx + w * h * 3]
+if len(pixels) < w * h * 3:
+    sys.exit("truncated PPM pixel payload")
+
+stride = w * 3
+raw_rows = bytearray((stride + 1) * h)
+for y in range(h):
+    dst = y * (stride + 1)
+    raw_rows[dst] = 0  # filter type 0 (None)
+    raw_rows[dst + 1 : dst + 1 + stride] = pixels[y * stride : (y + 1) * stride]
+
+def chunk(tag, body):
+    return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF)
+
+ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)  # 8-bit RGB
+png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw_rows), 6)) + chunk(b"IEND", b"")
+with open(png_path, "wb") as out:
+    out.write(png)
+PYEOF
+}
+
 apk_install_bundle() {
   local bundle="$1"
   command -v unzip >/dev/null 2>&1 || die "unzip missing inside container — run 'droideum setup'"
   local tmpd; tmpd=$(mktemp -d)
-  info "extracting split APK bundle $(basename "$bundle") ..."
-  if ! unzip -q "$bundle" '*.apk' -d "$tmpd" 2>/dev/null; then
+  if ! unzip -q "$bundle" -d "$tmpd" 2>/dev/null; then
     rm -rf "$tmpd"
-    die "bundle $(basename "$bundle") contains no .apk splits"
+    die "bundle $(basename "$bundle") is not a valid zip archive"
   fi
+
+  # Query live guest ABIs so split selection respects both native x86_64 and
+  # active libhoudini bridges (32-bit 9_y vs 64-bit 9_z).
+  local abilist
+  abilist=$(adb_ shell getprop ro.product.cpu.abilist 2>/dev/null | tr -d '\r' || true)
   local -a all_splits=() chosen=()
-  local s bn has_x86=0
+  local s bn best_abi=""
   while IFS= read -r s; do
     all_splits+=("$s")
-    bn=$(basename "$s")
-    case "$bn" in *x86_64*|*x86*) has_x86=1 ;; esac
   done < <(find "$tmpd" -type f -name '*.apk' | sort)
 
   if [ "${#all_splits[@]}" -eq 0 ]; then
@@ -692,23 +747,56 @@ apk_install_bundle() {
     die "no .apk files found inside $(basename "$bundle")"
   fi
 
-  # When a bundle contains both x86_64/x86 and arm64/armeabi ABI splits, drop
-  # the foreign ARM ABI splits so `adb install-multiple` does not reject them.
+  # Pick the highest-priority ABI split that exists in the bundle AND is supported
+  # by the guest (falling back to x86_64 -> x86 -> arm64 -> armeabi).
+  local cand tag
+  for cand in "x86_64:x86_64" "x86:x86" "arm64-v8a:arm64" "armeabi-v7a:armeabi"; do
+    local abi_name="${cand%%:*}" abi_pat="${cand#*:}"
+    if [ -n "$abilist" ] && [[ ",$abilist," != *",$abi_name,"* ]]; then
+      continue
+    fi
+    for s in "${all_splits[@]}"; do
+      bn=$(basename "$s" | tr '[:upper:]' '[:lower:]')
+      if [ "$abi_pat" = "x86" ]; then
+        case "$bn" in *x86_64*) continue ;; *x86*) best_abi="x86"; break 2 ;; esac
+      else
+        case "$bn" in *"$abi_pat"*) best_abi="$abi_pat"; break 2 ;; esac
+      fi
+    done
+  done
+
   for s in "${all_splits[@]}"; do
-    bn=$(basename "$s")
-    if [ "$has_x86" -eq 1 ]; then
-      case "$bn" in
-        *arm64_v8a*|*arm64-v8a*|*armeabi_v7a*|*armeabi-v7a*|*armeabi.apk) continue ;;
-      esac
+    bn=$(basename "$s" | tr '[:upper:]' '[:lower:]')
+    tag=""
+    case "$bn" in
+      *x86_64*) tag="x86_64" ;;
+      *x86*)    tag="x86" ;;
+      *arm64_v8a*|*arm64-v8a*|*arm64*) tag="arm64" ;;
+      *armeabi_v7a*|*armeabi-v7a*|*armeabi*) tag="armeabi" ;;
+    esac
+    if [ -n "$tag" ] && [ -n "$best_abi" ] && [ "$tag" != "$best_abi" ]; then
+      continue
     fi
     chosen+=("$s")
   done
 
   info "installing ${#chosen[@]} split APK(s) from $(basename "$bundle") ..."
-  local out
-  out=$(adb_ install-multiple -r -g -d "${chosen[@]}")
+  local out="" rc=0
+  out=$(adb_ install-multiple -r -g -d "${chosen[@]}") || rc=$?
+
+  # XAPK bundles often include Android/obb/<pkg>/*.obb expansion files — push them!
+  if [ "$rc" -eq 0 ] && grep -qi success <<<"$out" && [ -d "$tmpd/Android/obb" ]; then
+    local obb_file rel_dir
+    while IFS= read -r obb_file; do
+      rel_dir=$(dirname "${obb_file#"$tmpd/"}")
+      info "pushing OBB expansion $(basename "$obb_file") -> /sdcard/$rel_dir/"
+      adb_ shell mkdir -p "/sdcard/$rel_dir" >/dev/null 2>&1 || true
+      adb_ push "$obb_file" "/sdcard/$rel_dir/" >/dev/null 2>&1 || warn "could not push $(basename "$obb_file")"
+    done < <(find "$tmpd/Android/obb" -type f -name '*.obb' | sort)
+  fi
+
   rm -rf "$tmpd"
-  if grep -qi success <<<"$out"; then
+  if [ "$rc" -eq 0 ] && grep -qi success <<<"$out"; then
     ok "$(basename "$bundle") installed (${#chosen[@]} splits)"
     return 0
   fi
@@ -767,10 +855,27 @@ cmd_apk() {
       exec "$ADB_BIN" -s "127.0.0.1:$ADB_PORT" logcat "$@"
       ;;
     screenshot|shot)
-      adb_connect
-      local out="${1:-droideum-$(date +%Y%m%d-%H%M%S).png}"
-      adb_ exec-out screencap -p > "$out"
-      ok "saved $out" ;;
+      local use_mon=0 out=""
+      if [ "${1:-}" = "--monitor" ]; then use_mon=1; shift; fi
+      out="${1:-droideum-$(date +%Y%m%d-%H%M%S).png}"
+      if [ "$use_mon" -eq 1 ]; then
+        vm_pid >/dev/null || die "the VM must be running for --monitor screenshot"
+        local ppm="$RUN_DIR/screendump.ppm"
+        rm -f "$ppm"
+        monitor_cmd "screendump $ppm" >/dev/null || die "monitor screendump failed"
+        local tries=0
+        while [ ! -s "$ppm" ] && [ "$tries" -lt 25 ]; do sleep 0.1; tries=$((tries + 1)); done
+        [ -s "$ppm" ] || die "QEMU did not write $ppm"
+        _ppm_to_png "$ppm" "$out"
+        rm -f "$ppm"
+        ok "saved $out (via QEMU monitor screendump — no adb needed)"
+      else
+        adb_connect
+        # Never use `adb_` (which merges 2>&1) for binary PNG streams!
+        "$ADB_BIN" -s "127.0.0.1:$ADB_PORT" exec-out screencap -p > "$out" 2>/dev/null || \
+          die "screencap failed (try 'droideum apk screenshot --monitor $out' if adbd is stuck)"
+        ok "saved $out"
+      fi ;;
     *) die "usage: droideum apk {install|list|run|uninstall|logcat|screenshot} [args]" ;;
   esac
 }
@@ -1362,6 +1467,146 @@ cmd_profile() {
   esac
 }
 
+_apk_inspect_py() {
+  python3 - "$1" <<'PYEOF'
+import json, os, struct, sys, zipfile
+
+path = sys.argv[1]
+if not zipfile.is_zipfile(path):
+    sys.exit(f"not a valid zip/apk archive: {path}")
+
+def parse_axml(data):
+    if len(data) < 8 or struct.unpack_from("<I", data, 0)[0] != 0x00080003:
+        return {}
+    strings = []
+    info = {"permissions": []}
+    pos = 8
+    while pos + 8 <= len(data):
+        ctype, hdr_size, csize = struct.unpack_from("<HHI", data, pos)
+        if csize < 8 or pos + csize > len(data):
+            break
+        if ctype == 0x0001 and hdr_size >= 28:  # RES_STRING_POOL_TYPE
+            scount, _, flags, sstart, _ = struct.unpack_from("<IIIII", data, pos + 8)
+            is_utf8 = bool(flags & (1 << 8))
+            offsets = [struct.unpack_from("<I", data, pos + hdr_size + i * 4)[0] for i in range(scount)]
+            pool_base = pos + sstart
+            for off in offsets:
+                p = pool_base + off
+                if p >= pos + csize:
+                    strings.append("")
+                    continue
+                if is_utf8:
+                    # skip utf16 char len varint, read utf8 byte len varint
+                    p += 2 if (data[p] & 0x80) else 1
+                    blen = ((data[p] & 0x7F) << 8 | data[p + 1]) if (data[p] & 0x80) else data[p]
+                    p += 2 if (data[p] & 0x80) else 1
+                    strings.append(data[p : p + blen].decode("utf-8", "replace"))
+                else:
+                    clen = (struct.unpack_from("<H", data, p)[0] & 0x7FFF) << 16 | struct.unpack_from("<H", data, p + 2)[0] if (struct.unpack_from("<H", data, p)[0] & 0x8000) else struct.unpack_from("<H", data, p)[0]
+                    p += 4 if (struct.unpack_from("<H", data, p)[0] & 0x8000) else 2
+                    strings.append(data[p : p + clen * 2].decode("utf-16le", "replace"))
+        elif ctype == 0x0102 and hdr_size >= 16:  # RES_XML_START_ELEMENT_TYPE
+            name_idx = struct.unpack_from("<i", data, pos + 20)[0]
+            attr_start, attr_size, attr_count = struct.unpack_from("<HHH", data, pos + 24)
+            tag = strings[name_idx] if 0 <= name_idx < len(strings) else ""
+            abase = pos + 16 + attr_start
+            attrs = {}
+            for i in range(attr_count):
+                ap = abase + i * max(attr_size, 20)
+                if ap + 20 > pos + csize:
+                    break
+                _, aname_idx, raw_idx, _, dtype, dval = struct.unpack_from("<iiiHBxI", data, ap)
+                aname = strings[aname_idx] if 0 <= aname_idx < len(strings) else ""
+                if dtype == 0x03 and 0 <= dval < len(strings):
+                    val = strings[dval]
+                elif 0 <= raw_idx < len(strings):
+                    val = strings[raw_idx]
+                else:
+                    val = dval
+                attrs[aname] = val
+            if tag == "manifest":
+                info["package"] = attrs.get("package")
+                info["versionName"] = attrs.get("versionName")
+                info["versionCode"] = attrs.get("versionCode")
+            elif tag == "uses-sdk":
+                info["minSdkVersion"] = attrs.get("minSdkVersion")
+                info["targetSdkVersion"] = attrs.get("targetSdkVersion")
+            elif tag == "uses-permission" and attrs.get("name"):
+                info["permissions"].append(str(attrs["name"]))
+        pos += csize
+    return info
+
+def scan_apk_bytes(zf):
+    abis = set()
+    dex_count = 0
+    meta = {}
+    for n in zf.namelist():
+        if n.startswith("lib/") and n.endswith(".so"):
+            parts = n.split("/")
+            if len(parts) >= 3:
+                abis.add(parts[1])
+        elif n.endswith(".dex") and "/" not in n:
+            dex_count += 1
+    if "AndroidManifest.xml" in zf.namelist():
+        meta = parse_axml(zf.read("AndroidManifest.xml"))
+    return meta, sorted(abis), dex_count
+
+import io
+with zipfile.ZipFile(path, "r") as outer:
+    names = outer.namelist()
+    splits = [n for n in names if n.lower().endswith(".apk") and not n.endswith("/")]
+    obbs = [n for n in names if n.lower().endswith(".obb")]
+    if splits:
+        all_abis = set()
+        pkg_meta = {}
+        if "manifest.json" in names:
+            try:
+                mj = json.loads(outer.read("manifest.json").decode("utf-8", "replace"))
+                pkg_meta["package"] = mj.get("package_name")
+                pkg_meta["versionName"] = mj.get("version_name")
+                pkg_meta["minSdkVersion"] = mj.get("min_sdk_version")
+                pkg_meta["targetSdkVersion"] = mj.get("target_sdk_version")
+            except Exception:
+                pass
+        for s in splits:
+            bn = os.path.basename(s).lower()
+            for tag, canonical in (("x86_64", "x86_64"), ("arm64_v8a", "arm64-v8a"), ("arm64-v8a", "arm64-v8a"), ("armeabi_v7a", "armeabi-v7a"), ("armeabi-v7a", "armeabi-v7a")):
+                if tag in bn:
+                    all_abis.add(canonical)
+            with zipfile.ZipFile(io.BytesIO(outer.read(s)), "r") as inner:
+                m, a, _ = scan_apk_bytes(inner)
+                all_abis.update(a)
+                for k, v in m.items():
+                    if v and not pkg_meta.get(k):
+                        pkg_meta[k] = v
+        abis = sorted(all_abis)
+        kind = f"split-bundle ({len(splits)} splits" + (f", {len(obbs)} obb)" if obbs else ")")
+    else:
+        pkg_meta, abis, dex_count = scan_apk_bytes(outer)
+        kind = f"single-apk ({dex_count} dex)"
+
+if not abis or "x86_64" in abis or "x86" in abis:
+    compat = "native (runs directly on Android-x86 without armbridge)"
+elif "armeabi-v7a" in abis or "armeabi" in abis:
+    compat = "needs 'droideum armbridge 9_y' (32-bit ARM native libs)"
+else:
+    compat = "arm64-v8a only — needs 'droideum armbridge 9_z' or 'droideum profile use bliss14'"
+
+out = {
+    "file": os.path.basename(path),
+    "format": kind,
+    "package": pkg_meta.get("package"),
+    "versionName": pkg_meta.get("versionName"),
+    "minSdk": pkg_meta.get("minSdkVersion"),
+    "targetSdk": pkg_meta.get("targetSdkVersion"),
+    "abis": abis,
+    "compatibility": compat,
+    "permissions_count": len(pkg_meta.get("permissions") or []),
+}
+print(json.dumps(out, indent=2))
+PYEOF
+}
+
 # --- APK analysis lab (runs in this same proot aarch64 container) ------------
 cmd_lab() {
   load_config
@@ -1388,37 +1633,67 @@ cmd_lab() {
           warn "apktool unavailable"
         fi
       fi
-      ok "lab ready — try: droideum lab info app.apk" ;;
+      ok "lab ready — try: droideum lab inspect app.apk" ;;
+    inspect)
+      local f="${1:-}"; [ -f "$f" ] || die "usage: droideum lab inspect app.apk|bundle.apks|bundle.xapk"
+      _apk_inspect_py "$f" ;;
     info)
       local f="${1:-}"; [ -f "$f" ] || die "usage: droideum lab info app.apk"
-      command -v aapt >/dev/null 2>&1 || warn "aapt missing (droideum lab install) — falling back to the raw manifest"
-      aapt dump badging "$f" 2>/dev/null | grep -E '^(package|application-label|sdkVersion|targetSdkVersion|native-code|launchable-activity)' || \
-        unzip -p "$f" AndroidManifest.xml | head -c 400
-      ;;
+      if command -v aapt >/dev/null 2>&1; then
+        aapt dump badging "$f" 2>/dev/null | grep -E '^(package|application-label|sdkVersion|targetSdkVersion|native-code|launchable-activity)' || _apk_inspect_py "$f"
+      else
+        _apk_inspect_py "$f"
+      fi ;;
     abis)
       local f="${1:-}"; [ -f "$f" ] || die "usage: droideum lab abis app.apk"
       info "native ABIs inside $(basename "$f"):"
-      unzip -l "$f" 'lib/*' 2>/dev/null | awk '/lib\//{split($4,a,"/"); print a[2]}' | sort -u || say "  (none — pure Java/Kotlin, installs anywhere)"
-      ;;
+      local found
+      found=$(unzip -l "$f" 'lib/*' 2>/dev/null | awk '/lib\//{split($4,a,"/"); if(a[2]!="") print a[2]}' | sort -u || true)
+      if [ -n "$found" ]; then
+        printf '%s\n' "$found"
+      else
+        say "  (none — pure Java/Kotlin, or split bundle: run 'droideum lab inspect $(basename "$f")')"
+      fi ;;
     decode)
       local f="${1:-}"; [ -f "$f" ] || die "usage: droideum lab decode app.apk"
       apktool d -f -o "${f%.apk}_decoded" "$f" && ok "decoded -> ${f%.apk}_decoded/"
       ;;
-    *) die "usage: droideum lab {install|info app.apk|abis app.apk|decode app.apk}" ;;
+    *) die "usage: droideum lab {inspect app.apk|install|info app.apk|abis app.apk|decode app.apk}" ;;
   esac
 }
 
 cmd_doctor() {
   load_config
-  step "droideum doctor"
+  local do_fix=0
+  [ "${1:-}" = "--fix" ] && do_fix=1
+  step "droideum doctor$([ "$do_fix" -eq 1 ] && echo " (--fix)")"
   local bad=0
-  ck() { if eval "$2" >/dev/null 2>&1; then ok "$1"; else warn "MISSING: $1  ${3:-}"; bad=1; fi; }
-  ck "qemu-system-x86_64" "command -v qemu-system-x86_64" "run: droideum setup"
-  ck "qemu-img"           "command -v qemu-img"           "run: droideum setup"
-  ck "curl"               "command -v curl"
-  ck "adb"                "command -v adb"                "run: droideum setup"
-  ck "ISO present"        "test -f '$ISO_FILE'"           "run: droideum setup"
-  ck "disk present"       "test -f '$DISK_FILE'"          "run: droideum setup"
+
+  ck_bin() {
+    if command -v "$2" >/dev/null 2>&1; then ok "$1"
+    else warn "MISSING: $1  ${3:-}"; bad=1; fi
+  }
+  ck_file() {
+    if [ -f "$2" ]; then ok "$1"
+    else warn "MISSING: $1  ${3:-}"; bad=1; fi
+  }
+
+  ck_bin  "qemu-system-x86_64" "qemu-system-x86_64" "run: droideum setup"
+  ck_bin  "qemu-img"           "qemu-img"           "run: droideum setup"
+  ck_bin  "curl"               "curl"
+  ck_bin  "adb"                "$ADB_BIN"           "run: droideum setup"
+  ck_file "ISO present"        "$ISO_FILE"          "run: droideum setup"
+  ck_file "disk present"       "$DISK_FILE"         "run: droideum setup"
+
+  # Clean stale pid/socket files left behind after a container/phone crash
+  if [ -f "$PID_FILE" ] && ! vm_pid >/dev/null; then
+    if [ "$do_fix" -eq 1 ]; then
+      rm -f "$PID_FILE" "$MON_SOCK"
+      ok "removed stale PID/socket files from a previous unclean exit"
+    else
+      warn "stale PID file ($PID_FILE) with no running QEMU — run 'droideum doctor --fix'"
+    fi
+  fi
 
   local free; free=$(df -Pm "$DROIDEUM_HOME" 2>/dev/null | awk 'NR==2{print $4}')
   if [ "${free:-0}" -ge "$MIN_FREE_MB" ]; then ok "free space ${free}MB"
@@ -1431,7 +1706,17 @@ cmd_doctor() {
     else warn "qcow2 image reports errors — 'droideum restore <snapshot>' or reinstall"; bad=1; fi
     local leaks
     leaks=$(qemu-img check "$DISK_FILE" 2>/dev/null | grep -i 'leaked' | head -1 || true)
-    [ -n "$leaks" ] && warn "disk space leak: $leaks  (reclaim with: qemu-img check -r leaks ...)"
+    if [ -n "$leaks" ]; then
+      if [ "$do_fix" -eq 1 ]; then
+        if qemu-img check -r leaks "$DISK_FILE" >/dev/null 2>&1; then
+          ok "repaired qcow2 leaked clusters"
+        else
+          warn "could not repair leaks"
+        fi
+      else
+        warn "disk space leak: $leaks  (reclaim with: droideum doctor --fix)"
+      fi
+    fi
     local snaps; snaps=$(vm_snapshots | tr '\n' ' ')
     [ -n "$snaps" ] && say "  saved states: $snaps"
     say "  disk on flash: $(du -h "$DISK_FILE" 2>/dev/null | cut -f1) / virtual $(qemu-img info --output=json "$DISK_FILE" 2>/dev/null | tr -d ' \n' | grep -o '"virtual-size":[0-9]*' | cut -d: -f2 | awk '{printf "%.0fG", $1/1073741824}')"
@@ -1453,11 +1738,12 @@ cmd_doctor() {
     warn "RAM_MB=${RAM_MB} is below what Android 9 needs (>=1536). system_server gets killed by"
     warn "the guest's own low-memory killer mid-boot and 'pm install' dies with 'Broken pipe'."
   fi
-  if command -v adb >/dev/null 2>&1 && adb_online; then
+  if command -v "$ADB_BIN" >/dev/null 2>&1 && adb_online; then
     local anim
     anim=$(adb_ shell settings get global window_animation_scale 2>/dev/null | tr -d '\r')
     if [ "${anim:-1}" = "0" ]; then ok "Android animations disabled (fast settle)"
-    else warn "Android animations still on — run 'droideum up --tune' or 'droideum tune'"; fi
+    elif [ "$do_fix" -eq 1 ]; then cmd_tune
+    else warn "Android animations still on — run 'droideum doctor --fix' or 'droideum tune'"; fi
   fi
   return $bad
 }
@@ -1474,7 +1760,7 @@ ${C_B}ONE-TIME${C_R}
 
 ${C_B}FOR AI AGENTS${C_R}  (no VNC, no tapping — machine-readable control)
   droideum up                    headless boot + block until Android answers adb
-  droideum agent serve --autostart   MCP tool server on stdio (30 tools)
+  droideum agent serve --autostart   MCP tool server on stdio (34 tools + 4 resources)
   droideum agent config claude   print the MCP client snippet (claude|codex|cursor|gemini)
   droideum agent tool            list agent tools with one-line descriptions
   droideum agent observe         human-readable screen + UI tree right now
@@ -1520,12 +1806,13 @@ ${C_B}DISK${C_R}
   droideum snapshot [name] | restore <name> | snapshots
 
 ${C_B}APK LAB${C_R} (inside the proot aarch64 container, no VM needed)
+  droideum lab inspect app.apk   offline binary manifest + ABI + armbridge check (no Java!)
   droideum lab install           apktool / aapt / jadx toolchain
   droideum lab info app.apk      package, version, target SDK
   droideum lab abis app.apk      which CPU architectures the APK ships
   droideum lab decode app.apk    decompile resources + smali
 
-  droideum doctor                diagnose the install
+  droideum doctor [--fix]        diagnose (and auto-repair) the install
   droideum config                print config file path
   droideum version
 

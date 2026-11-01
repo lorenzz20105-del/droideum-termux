@@ -155,7 +155,7 @@ Next steps (type these in Termux):
 
 For AI agents (no VNC, machine-readable):
   droideum up                              # headless boot, blocks until adb answers
-  droideum agent serve --autostart         # MCP server on stdio (30 tools)
+  droideum agent serve --autostart         # MCP server on stdio (34 tools + 4 resources)
   droideum agent config claude             # paste-ready MCP client config
   droideum agent tool                      # what the agent can do
 

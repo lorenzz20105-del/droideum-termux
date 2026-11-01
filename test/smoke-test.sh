@@ -95,6 +95,12 @@ if [ -n "${STUB_MON_LOG:-}" ]; then
   i=0
   while [ "$i" -lt 150 ]; do
     grep -q '^quit$' "$STUB_MON_LOG" 2>/dev/null && exit 0
+    if grep -q '^screendump ' "$STUB_MON_LOG" 2>/dev/null; then
+      ppm_dest=$(awk '/^screendump /{print $2}' "$STUB_MON_LOG" | tail -1)
+      if [ -n "$ppm_dest" ] && [ ! -f "$ppm_dest" ]; then
+        printf 'P6\n2 1\n255\n\377\000\000\000\377\000' > "$ppm_dest"
+      fi
+    fi
     if [ "${STUB_IGNORE_ACPI:-0}" != "1" ] && grep -q '^system_powerdown$' "$STUB_MON_LOG" 2>/dev/null; then
       exit 0
     fi
@@ -133,7 +139,9 @@ case "$*" in
   *"wm density"*) echo "Physical density: 440" ;;
   *"uiautomator dump"*) echo "UI hierchary dumped to: /sdcard/window_dump.xml" ;;
   *"exec-out cat"*) echo '<?xml version="1.0"?><hierarchy><node class="android.widget.Button" text="OK" clickable="true" bounds="[0,0][10,10]"/></hierarchy>' ;;
-  *"exec-out screencap"*) printf '\211PNG\r\n\032\n0000000000' ;;
+  *"exec-out screencap"*)
+      echo "* daemon not running; starting now *" >&2
+      printf '\211PNG\r\n\032\n0000000000' ;;
   *"push"*) echo "1 file pushed." ;;
   *"pull"*) echo "1 file pulled." ;;
   *"settings get"*) echo "0" ;;
@@ -313,6 +321,29 @@ t   "split bundle (.apks) install exits 0" "0" "$(STUB_ADB_MODE=ok run apk insta
 has "split bundle uses install-multiple" "install-multiple -r -g -d" "$STUB_CALLS.adb"
 has "split bundle keeps x86_64 split" "split_config.x86_64.apk" "$STUB_CALLS.adb"
 hasnt "split bundle filters foreign arm64 split" "split_config.arm64_v8a.apk" "$STUB_CALLS.adb"
+python3 - "$WORK/game.xapk" <<'PYEOF'
+import io, json, sys, zipfile
+inner_buf = io.BytesIO()
+with zipfile.ZipFile(inner_buf, "w") as iz:
+    iz.writestr("classes.dex", b"dex\n035\x00")
+    iz.writestr("lib/arm64-v8a/libgame.so", b"\x7fELF")
+with zipfile.ZipFile(sys.argv[1], "w") as zf:
+    zf.writestr("manifest.json", json.dumps({"package_name": "com.example.game", "version_name": "2.1.0"}))
+    zf.writestr("com.example.game.apk", inner_buf.getvalue())
+    zf.writestr("Android/obb/com.example.game/main.1.com.example.game.obb", b"OBBPAYLOAD")
+PYEOF
+: > "$STUB_CALLS.adb"
+t   "xapk with OBB installs cleanly" "0" "$(STUB_ADB_MODE=ok run apk install "$WORK/game.xapk")"
+has "xapk pushes OBB expansion to /sdcard/Android/obb" "/sdcard/Android/obb/com.example.game/" "$STUB_CALLS.adb"
+t   "lab inspect works offline without Java/aapt" "0" "$(run lab inspect "$WORK/game.xapk")"
+has "lab inspect extracts package name" '"package": "com.example.game"' "$WORK/out"
+has "lab inspect detects arm64 bridge requirement" "armbridge 9_z" "$WORK/out"
+t   "apk screenshot preserves binary PNG magic despite adb stderr" "0" \
+    "$(run apk screenshot "$WORK/shot.png" >/dev/null && head -c 4 "$WORK/shot.png" | grep -q PNG && echo 0 || echo 1)"
+t   "start for monitor screenshot" "0" "$(run start)"
+t   "apk screenshot --monitor converts HMP PPM to PNG" "0" \
+    "$(run apk screenshot --monitor "$WORK/mon.png" >/dev/null && head -c 4 "$WORK/mon.png" | grep -q PNG && echo 0 || echo 1)"
+run stop >/dev/null
 t   "abi failure exits 1"    "1" "$(STUB_ADB_MODE=abis run apk install "$WORK/app.apk")"
 has "abi advice"             "armbridge" "$WORK/out"
 run apk list >/dev/null
@@ -322,6 +353,8 @@ echo "== doctor =="
 t   "doctor exits 0 (stubbed)" "0" "$(run doctor)"
 has "doctor checks qcow2"    "consistent" "$WORK/out"
 has "doctor reports accel"   "TCG" "$WORK/out"
+echo 999999 > "$DROIDEUM_HOME/run/qemu.pid"
+t   "doctor --fix cleans stale dead PID" "0" "$(run doctor --fix >/dev/null && [ ! -f "$DROIDEUM_HOME/run/qemu.pid" ] && echo 0 || echo 1)"
 
 echo "== agent wiring =="
 cat > "$STUB/droideum-agentd" <<'EOF'
@@ -342,7 +375,7 @@ t   "unknown agent sub fails" "1" "$(run agent frobnicate)"
 echo "== misc =="
 t   "unknown command fails"  "1" "$(run wat)"
 run version >/dev/null
-has "version prints"         "droideum 1.4.0" "$WORK/out"
+has "version prints"         "droideum 1.5.0" "$WORK/out"
 run res 1600x900 320 >/dev/null
 has "res passes wm size"     "wm size 1600x900" "$STUB_CALLS.adb"
 has "res passes wm density"  "wm density 320" "$STUB_CALLS.adb"

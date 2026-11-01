@@ -12,28 +12,32 @@ check: lint test          # everything CI runs
 
 test: smoke mcp selftest  # every test suite
 
-smoke:                    # 139 CLI assertions, stubbed QEMU/adb, no VM needed
+smoke:                    # CLI assertions, stubbed QEMU/adb, no VM needed
 	@bash test/smoke-test.sh
 
-mcp:                      # 75 MCP protocol assertions
+mcp:                      # MCP protocol + 34-tool + resource assertions
 	@STUB_ADB=1 python3 test/mcp-test.py
 
 selftest:                 # agent server internal consistency
 	@./bin/droideum-agentd selftest
 
-lint:                     # shellcheck must be completely silent
+lint:                     # shellcheck + python syntax + version sync
 	@if command -v shellcheck >/dev/null 2>&1; then \
 	  shellcheck -S info $(SCRIPTS) && echo "shellcheck: clean"; \
 	else \
 	  echo "shellcheck not installed (pip install shellcheck-py) - skipped"; \
 	fi
+	@python3 -m py_compile bin/droideum-agentd examples/agent_loop.py test/mcp-test.py
+	@v1=$$(./bin/droideum --version | awk '{print $$2}'); \
+	 v2=$$(./bin/droideum-agentd --version | awk '{print $$2}'); \
+	 [ "$$v1" = "$$v2" ] || { echo "version mismatch: droideum=$$v1 agentd=$$v2" >&2; exit 1; }
 
 lint-install:             # install shellcheck via pip/pkgs
 	@pip install --quiet shellcheck-py || pkg install -y shellcheck
 
 version:                  # print component versions
 	@./bin/droideum --version
-	@./bin/droideum-agentd --version 2>/dev/null || true
+	@./bin/droideum-agentd --version
 
 help:                     # this list
 	@echo "droideum developer tasks:"
