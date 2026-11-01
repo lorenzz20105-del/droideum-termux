@@ -6,6 +6,11 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 DROIDEUM_ROOT="$HERE"
+# Read the version from the script itself instead of hardcoding it here.
+# A literal "1.5.0" in this file means every release has to remember to edit
+# the test as well -- forget once and CI fails on a release commit for a
+# reason that has nothing to do with the change.
+EXPECT_VER="$(sed -n 's/^DROIDEUM_VERSION="\(.*\)"/\1/p' "$HERE/bin/droideum")"
 WORK="$(mktemp -d)"
 STUB="$WORK/stub"
 mkdir -p "$STUB"
@@ -375,7 +380,8 @@ t   "unknown agent sub fails" "1" "$(run agent frobnicate)"
 echo "== misc =="
 t   "unknown command fails"  "1" "$(run wat)"
 run version >/dev/null
-has "version prints"         "droideum 1.5.0" "$WORK/out"
+has "version prints"         "droideum $EXPECT_VER" "$WORK/out"
+has "version is not stale"   "droideum 1." "$WORK/out"
 run res 1600x900 320 >/dev/null
 has "res passes wm size"     "wm size 1600x900" "$STUB_CALLS.adb"
 has "res passes wm density"  "wm density 320" "$STUB_CALLS.adb"
