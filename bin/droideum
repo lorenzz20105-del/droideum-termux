@@ -19,7 +19,7 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
   exit 1
 fi
 
-DROIDEUM_VERSION="1.5.0"
+DROIDEUM_VERSION="1.5.1"
 
 # Capture caller-supplied environment overrides BEFORE setting built-in defaults;
 # otherwise bash sees `${VAR:-default}` as `+set` and silently clobbers every

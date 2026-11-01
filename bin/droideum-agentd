@@ -41,13 +41,27 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 
 SERVER_NAME = "droideum-agentd"
-SERVER_VERSION = "1.5.0"
+SERVER_VERSION = "1.5.1"
 PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
+
+# JSON-RPC 2.0 error codes, and how a ToolError's own code maps onto them.
+JSONRPC_PARSE_ERROR = -32700
+JSONRPC_INVALID_REQUEST = -32600
+JSONRPC_METHOD_NOT_FOUND = -32601
+JSONRPC_INVALID_PARAMS = -32602
+JSONRPC_INTERNAL_ERROR = -32603
+
+_TOOL_CODE_TO_RPC = {
+    "METHOD_NOT_FOUND": JSONRPC_METHOD_NOT_FOUND,
+    "BAD_ARGS": JSONRPC_INVALID_PARAMS,
+    "INVALID_PARAMS": JSONRPC_INVALID_PARAMS,
+}
 
 HOME = os.environ.get("DROIDEUM_HOME", os.path.expanduser("~/.droideum"))
 
@@ -1872,8 +1886,16 @@ def read_resource(uri):
 
 
 def handle(msg):
+    if not isinstance(msg, dict):
+        raise ToolError("a JSON-RPC message must be an object", code="INVALID_PARAMS")
     method = msg.get("method")
     params = msg.get("params") or {}
+    if not isinstance(params, dict):
+        raise ToolError(
+            f"`params` must be an object, got {type(params).__name__}",
+            hint='send {"params": {"name": ..., "arguments": {...}}} for tools/call',
+            code="INVALID_PARAMS",
+        )
 
     if method == "initialize":
         requested = params.get("protocolVersion")
@@ -1940,6 +1962,36 @@ def handle(msg):
     raise ToolError(f"method not found: {method}", code="METHOD_NOT_FOUND")
 
 
+def start_vm_headless(timeout=1800):
+    """Start the VM via `droideum up`, keeping the JSON-RPC stream clean.
+
+    stdout is the MCP transport. `droideum up` is a bash script that prints
+    progress (`==> booting`, `  ok  VM up`) to stdout, so calling it with an
+    inherited stdout injects non-JSON text straight into the protocol stream and
+    the client sees a corrupted session at exactly the moment it is initialising.
+    Capture it and forward to stderr instead, where diagnostics belong.
+    """
+    try:
+        p = subprocess.run(["droideum", "up"], timeout=timeout, check=False,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except FileNotFoundError:
+        raise ToolError("`droideum` not found on PATH",
+                        hint="run this server from inside the Termux container where droideum is installed",
+                        code="NO_CLI")
+    except subprocess.TimeoutExpired:
+        raise ToolError(f"`droideum up` did not finish within {timeout}s",
+                        hint="check `droideum log`; the VM may be stuck booting",
+                        code="BOOT_TIMEOUT")
+    for line in (p.stdout or "").splitlines():
+        if line.strip():
+            log(f"up| {line.rstrip()}")
+    if p.returncode != 0:
+        raise ToolError(f"`droideum up` exited {p.returncode}",
+                        hint="run `droideum up` by hand to see the failure",
+                        code="UP_FAILED")
+    return p.returncode
+
+
 def serve(autostart=False, fresh=None):
     log(f"serving MCP on stdio (home={HOME}, serial={SERIAL})")
     if autostart:
@@ -1949,36 +2001,101 @@ def serve(autostart=False, fresh=None):
                 monitor_command(f"loadvm {fresh}", timeout=240)
             if not vm_running():
                 log("VM not running — starting headless (droideum up)")
-                subprocess.run(["droideum", "up"], timeout=1800, check=False)
+                start_vm_headless()
             wait_boot()
             ADB.ensure()
             log("device ready")
         except Exception as e:  # stay alive: the agent can still query device.status
             log(f"autostart problem: {e}")
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+    def emit(payload):
+        """Write one JSON-RPC message. False means the client went away."""
         try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": None,
-                                         "error": {"code": -32700, "message": "parse error"}}) + "\n")
+            sys.stdout.write(json.dumps(payload) + "\n")
             sys.stdout.flush()
-            continue
-        is_notification = "id" not in msg
-        try:
-            result = handle(msg)
-        except ToolError as e:
-            if not is_notification:
-                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg.get("id"),
-                                             "error": {"code": -32601, "message": str(e)}}) + "\n")
+            return True
+        except BrokenPipeError:
+            return False
+        except (TypeError, ValueError) as e:
+            # a tool returned something that cannot be serialised; report that
+            # rather than dying mid-write and leaving a partial line on stdout
+            log(f"could not serialise response: {e}")
+            try:
+                sys.stdout.write(json.dumps(
+                    {"jsonrpc": "2.0", "id": payload.get("id"),
+                     "error": {"code": JSONRPC_INTERNAL_ERROR,
+                               "message": f"response not serialisable: {e}"}}) + "\n")
                 sys.stdout.flush()
-            continue
-        if not is_notification and result is not None:
-            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg.get("id"), "result": result}) + "\n")
-            sys.stdout.flush()
+                return True
+            except (BrokenPipeError, TypeError, ValueError):
+                return False
+
+    def rpc_error(msg_id, code, message, data=None):
+        err = {"code": code, "message": message}
+        if data:
+            err["data"] = data
+        return {"jsonrpc": "2.0", "id": msg_id, "error": err}
+
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError as e:
+                if not emit(rpc_error(None, JSONRPC_PARSE_ERROR, f"parse error: {e.msg}")):
+                    break
+                continue
+
+            # A protocol server must never be taken down by one bad message: the
+            # agent loses the device, its place in the task, and the session.
+            # Everything below reports the problem and keeps serving.
+            if not isinstance(msg, dict):
+                if not emit(rpc_error(None, JSONRPC_INVALID_REQUEST,
+                                      "invalid request: a JSON-RPC message must be an object")):
+                    break
+                continue
+
+            msg_id = msg.get("id")
+            is_notification = "id" not in msg
+            if not is_notification and not isinstance(msg_id, (str, int, float, type(None))):
+                if not emit(rpc_error(None, JSONRPC_INVALID_REQUEST,
+                                      f"invalid request: id must be string, number or null, "
+                                      f"got {type(msg_id).__name__}")):
+                    break
+                continue
+
+            try:
+                result = handle(msg)
+            except ToolError as e:
+                log(f"{msg.get('method')} failed: {e}")
+                if not is_notification:
+                    data = {"code": e.code}
+                    if e.hint:
+                        data["hint"] = e.hint
+                    if not emit(rpc_error(msg_id,
+                                          _TOOL_CODE_TO_RPC.get(e.code, JSONRPC_INTERNAL_ERROR),
+                                          str(e), data)):
+                        break
+                continue
+            except Exception as e:                       # noqa: BLE001
+                log(f"unhandled error in {msg.get('method')!r}: {type(e).__name__}: {e}\n"
+                    + traceback.format_exc(limit=4))
+                if not is_notification:
+                    if not emit(rpc_error(msg_id, JSONRPC_INTERNAL_ERROR,
+                                          f"internal error: {type(e).__name__}: {e}",
+                                          {"code": "INTERNAL"})):
+                        break
+                continue
+
+            if not is_notification and result is not None:
+                if not emit({"jsonrpc": "2.0", "id": msg_id, "result": result}):
+                    break
+    except KeyboardInterrupt:
+        log("interrupted")
+    except BrokenPipeError:
+        pass
     log("stdin closed, exiting")
 
 

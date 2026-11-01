@@ -1,7 +1,7 @@
 # droideum
 
 [![ci](https://github.com/lorenzz20105-del/droideum-termux/actions/workflows/ci.yml/badge.svg)](https://github.com/lorenzz20105-del/droideum-termux/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/droideum-1.5.0-blue)]()
+[![version](https://img.shields.io/badge/droideum-1.5.1-blue)]()
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platform](https://img.shields.io/badge/runs%20in-Termux%20(proot%20aarch64)-black)]()
 [![root](https://img.shields.io/badge/root-not%20required-success)]()

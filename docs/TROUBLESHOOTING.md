@@ -230,3 +230,26 @@ wget` fail with *Network is unreachable*. Use `droideum transfer file` instead �
 
 adbd is up and listening but the handshake does not complete. Do not loop on `adb kill-server`; use the
 serial console (`droideum console bridge`), which needs no authentication.
+
+## The MCP server exits as soon as my client sends a message
+
+Fixed in **1.5.1**. Before that, a malformed JSON-RPC message could take the whole
+server down, and the agent lost the device and its place in the task with it:
+
+| the client sent | old behaviour | now |
+|---|---|---|
+| `[1,2,3]` (array) | `AttributeError: 'list' object has no attribute 'get'`, process exits 1 | `-32600 Invalid Request`, server keeps serving |
+| `"params": "oops"` | `AttributeError: 'str' object has no attribute 'get'`, process exits 1 | `-32602 Invalid params` + a hint |
+| unknown method | `-32601` (correct, but no detail) | `-32601` + `data.code` |
+| a tool raising a non-ToolError exception | process exits 1 | `-32603 Internal error`, logged to stderr, server keeps serving |
+
+If you are on 1.5.0 or older and your agent "randomly disconnects", check the
+server's stderr for a traceback — that is this bug, and upgrading fixes it.
+
+## Containers show `==> booting` inside the MCP stream
+
+Fixed in **1.5.1**. `serve --autostart` ran `droideum up` with an inherited
+stdout, and `droideum up` prints its progress to stdout — which is the JSON-RPC
+transport. Clients received shell output interleaved with `initialize`. The VM
+startup output now goes to stderr prefixed with `up|`.
+

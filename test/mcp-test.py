@@ -544,8 +544,134 @@ def stub_tests():
     c.close()
 
 
+
+def robustness_tests():
+    """A protocol server must survive one bad message.
+
+    Regression: an array-shaped JSON-RPC message, or `params` sent as a string,
+    used to raise AttributeError straight out of serve() and kill the process.
+    The agent lost the device, its position in the task, and the whole session.
+    Each case below asserts two things: the right JSON-RPC error code, AND that
+    the server is still answering afterwards.
+    """
+    print("== offline: protocol robustness ==")
+
+    def survives(label, raw, want_code):
+        c = Client()
+        try:
+            c.p.stdin.write(raw + "\n")
+            c.p.stdin.flush()
+            line = c.p.stdout.readline()
+            try:
+                resp = json.loads(line)
+            except ValueError:
+                check(f"{label}: server replied", False, repr(line[:120]))
+                return
+            got = resp.get("error", {}).get("code")
+            check(f"{label} -> {want_code}", got == want_code, f"got {got}: {line[:160]}")
+            # the real assertion: still alive and still serving
+            pong = c.rpc("ping")
+            check(f"{label}: still serving afterwards", pong.get("result") == {})
+        finally:
+            c.close()
+
+    survives("array message gives -32600", '[1,2,3]', -32600)
+    survives("bare string gives -32600", '"hello"', -32600)
+    survives("null message gives -32600", 'null', -32600)
+    survives("params as string gives -32602",
+             '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":"oops"}', -32602)
+    survives("unknown method gives -32601",
+             '{"jsonrpc":"2.0","id":1,"method":"does/not/exist"}', -32601)
+
+    # invalid JSON must report -32700 and not kill the stream either
+    c = Client()
+    try:
+        c.p.stdin.write("{not json\n")
+        c.p.stdin.flush()
+        resp = json.loads(c.p.stdout.readline())
+        check("malformed JSON gives -32700", resp["error"]["code"] == -32700)
+        check("malformed JSON: still serving", c.rpc("ping").get("result") == {})
+    finally:
+        c.close()
+
+    # error data must carry the recovery hint, or the agent cannot self-correct
+    c = Client()
+    try:
+        resp = c.rpc("tools/call", {"name": "nope.not.a.tool", "arguments": {}})
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        check("unknown tool reports isError", resp["result"].get("isError") is True)
+        check("unknown tool carries a code", "code" in payload)
+    finally:
+        c.close()
+
+    # a tool that fails with a non-dict param shape must not escape as a crash
+    c = Client()
+    try:
+        resp = c.rpc("tools/call", {"name": "logcat.tail", "arguments": {"lines": "abc"}})
+        text = resp["result"]["content"][0]["text"]
+        check("bad argument type reported, not raised", "error" in text, text[:120])
+        check("bad argument type: still serving", c.rpc("ping").get("result") == {})
+    finally:
+        c.close()
+
+
+
+def stdout_purity_tests():
+    """stdout is the MCP transport. Nothing else may write to it.
+
+    Regression: `serve --autostart` called `subprocess.run(["droideum","up"])`
+    with an inherited stdout. `droideum up` prints progress to stdout, so the
+    client received `==> starting the VM` interleaved into the JSON-RPC stream
+    during initialize -- a corrupted session at the worst possible moment.
+    """
+    print("== offline: stdout purity (autostart) ==")
+    import importlib.util
+    import io
+    from importlib.machinery import SourceFileLoader
+
+    loader = SourceFileLoader("agentd_mod", SERVER)
+    spec = importlib.util.spec_from_loader("agentd_mod", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+
+    tmp = tempfile.mkdtemp()
+    fake = os.path.join(tmp, "droideum")
+    with open(fake, "w") as fh:
+        fh.write("#!/bin/sh\necho '==> starting the VM'\necho '  ok  VM up'\nexit 0\n")
+    os.chmod(fake, 0o755)
+    old_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tmp + os.pathsep + old_path
+    try:
+        buf = io.StringIO()
+        real = sys.stdout
+        sys.stdout = buf
+        try:
+            mod.start_vm_headless()
+        finally:
+            sys.stdout = real
+        check("autostart leaks nothing to stdout", buf.getvalue().strip() == "",
+              repr(buf.getvalue()[:80]))
+
+        # a failing `droideum up` must be a reported ToolError, not a crash
+        with open(fake, "w") as fh:
+            fh.write("#!/bin/sh\necho 'boom: no KVM'\nexit 3\n")
+        os.chmod(fake, 0o755)
+        raised = None
+        try:
+            mod.start_vm_headless()
+        except mod.ToolError as e:
+            raised = e
+        check("autostart failure raises ToolError", raised is not None)
+        check("autostart failure carries a hint", bool(getattr(raised, "hint", None)))
+        check("autostart failure has a code", getattr(raised, "code", "") == "UP_FAILED")
+    finally:
+        os.environ["PATH"] = old_path
+
+
 def main():
     offline_tests()
+    robustness_tests()
+    stdout_purity_tests()
     if os.environ.get("STUB_ADB") == "1":
         stub_tests()
     else:
