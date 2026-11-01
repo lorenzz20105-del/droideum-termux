@@ -19,7 +19,23 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
   exit 1
 fi
 
-DROIDEUM_VERSION="1.3.0"
+DROIDEUM_VERSION="1.4.0"
+
+# Capture caller-supplied environment overrides BEFORE setting built-in defaults;
+# otherwise bash sees `${VAR:-default}` as `+set` and silently clobbers every
+# setting inside droideum.conf!
+OVERRIDABLE=(
+  RAM_MB CORES CPU_MODEL TB_SIZE USE_KVM DISK_SIZE DISK_FILE MIN_FREE_MB
+  ISO_URL ISO_SHA1 ISO_FILE_OVERRIDE VNC_DISPLAY VNC_ADDR DISPLAY_BACKEND ADB_PORT
+  CONSOLE_PORT AUTOSAVE_NAME SAVE_ON_STOP STOP_TIMEOUT STOP_QUICK_TIMEOUT
+  RESUME_ADB_TIMEOUT EXTRA_QEMU_ARGS LIVE_MODE BOOT_TIMEOUT BOOT_CMDLINE_EXTRA
+  PUSH_DEST RESUME_BACKEND FAST_BOOT LAUNCH_WAIT
+)
+declare -A _CALLER_ENV=()
+for _k in "${OVERRIDABLE[@]}"; do
+  if [ -n "${!_k+set}" ]; then _CALLER_ENV[$_k]="${!_k}"; fi
+done
+unset _k
 
 # --- locations ---------------------------------------------------------------
 DROIDEUM_HOME="${DROIDEUM_HOME:-$HOME/.droideum}"
@@ -36,8 +52,10 @@ QEMU_LOG="$LOG_DIR/qemu.log"
 MON_SOCK="$RUN_DIR/monitor.sock"
 
 # --- defaults (overridable in droideum.conf or the environment) --------------
-ISO_URL="${ISO_URL:-https://sourceforge.net/projects/android-x86/files/Release%209.0/android-x86_64-9.0-r2.iso/download}"
-ISO_SHA1="${ISO_SHA1:-1cc85b5ed7c830ff71aecf8405c7281a9c995aa0}"
+DEFAULT_ISO_URL="https://sourceforge.net/projects/android-x86/files/Release%209.0/android-x86_64-9.0-r2.iso/download"
+DEFAULT_ISO_SHA1="1cc85b5ed7c830ff71aecf8405c7281a9c995aa0"
+ISO_URL="${ISO_URL:-$DEFAULT_ISO_URL}"
+ISO_SHA1="${ISO_SHA1:-$DEFAULT_ISO_SHA1}"
 DISK_SIZE="${DISK_SIZE:-16G}"
 RAM_MB="${RAM_MB:-}"
 CORES="${CORES:-}"
@@ -52,17 +70,25 @@ CONSOLE_PORT="${CONSOLE_PORT:-4555}" # guest serial console (works when adb does
 CONSOLE_LOG="$RUN_DIR/console.log"
 CONSOLE_IN="$RUN_DIR/console.in"
 LIVE_MODE="${LIVE_MODE:-0}"          # 1 = boot the ISO live, no install, no disk
+FAST_BOOT="${FAST_BOOT:-1}"          # 1 = tune skips heavy dex2oat AOT under TCG
+LAUNCH_WAIT="${LAUNCH_WAIT:-0.4}"    # startup health-check pause (seconds)
 VNC_ADDR="${VNC_ADDR:-127.0.0.1}"
 VNC_DISPLAY="${VNC_DISPLAY:-0}"
 ADB_PORT="${ADB_PORT:-5555}"
 DISPLAY_BACKEND="${DISPLAY_BACKEND:-vnc}"   # vnc | gtk | sdl | none
 EXTRA_QEMU_ARGS="${EXTRA_QEMU_ARGS:-}"
 
-# A custom ISO_URL gets its own cache slot instead of overwriting (or silently
-# reusing) the default Android image. Must come after ISO_URL's default above.
-_iso_name="$(basename "${ISO_URL%%/download}")"
-case "$_iso_name" in *.iso) : ;; *) _iso_name="${_iso_name:-android-image}.iso" ;; esac
-: "${ISO_FILE:=${ISO_FILE_OVERRIDE:-$CACHE_DIR/$_iso_name}}"
+_derive_iso_file() {
+  local _iso_name
+  _iso_name="$(basename "${ISO_URL%%/download}")"
+  case "$_iso_name" in *.iso) : ;; *) _iso_name="${_iso_name:-android-image}.iso" ;; esac
+  if [ -n "${ISO_FILE_OVERRIDE:-}" ]; then
+    ISO_FILE="$ISO_FILE_OVERRIDE"
+  else
+    ISO_FILE="$CACHE_DIR/$_iso_name"
+  fi
+}
+_derive_iso_file
 
 HOUDINI_URL_32="${HOUDINI_URL_32:-http://dl.android-x86.org/houdini/9_y/houdini.sfs}"
 HOUDINI_URL_64="${HOUDINI_URL_64:-http://dl.android-x86.org/houdini/9_z/houdini.sfs}"
@@ -82,33 +108,19 @@ die()  { printf '%serr %s %s\n' "$C_E" "$C_R" "$*" >&2; exit 1; }
 step() { printf '\n%s%s%s\n' "$C_B" "$*" "$C_R"; }
 
 # --- config ------------------------------------------------------------------
-# Tunables that an exported environment variable may override. Environment beats
-# the config file, which beats the defaults — otherwise `RAM_MB=768 droideum up`
-# would be silently ignored whenever droideum.conf mentions RAM_MB.
-OVERRIDABLE=(
-  RAM_MB CORES CPU_MODEL TB_SIZE USE_KVM RAM_MB DISK_SIZE DISK_FILE MIN_FREE_MB
-  ISO_URL ISO_SHA1 ISO_FILE_OVERRIDE VNC_DISPLAY VNC_ADDR DISPLAY_BACKEND ADB_PORT
-  CONSOLE_PORT AUTOSAVE_NAME SAVE_ON_STOP STOP_TIMEOUT STOP_QUICK_TIMEOUT
-  RESUME_ADB_TIMEOUT EXTRA_QEMU_ARGS LIVE_MODE BOOT_TIMEOUT
-)
-
+# Precedence: caller environment (_CALLER_ENV) > droideum.conf > built-in default.
 load_config() {
   local _k
-  local -A _from_env=()
-  for _k in "${OVERRIDABLE[@]}"; do
-    if [ -n "${!_k+set}" ]; then _from_env[$_k]="${!_k}"; fi
-  done
-
   mkdir -p "$DROIDEUM_HOME" "$CACHE_DIR" "$RUN_DIR" "$SNAP_DIR" "$LOG_DIR"
   # shellcheck disable=SC1090
   [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
-  # re-assert anything that came from the environment
-  for _k in "${!_from_env[@]}"; do
-    printf -v "$_k" '%s' "${_from_env[$_k]}"
+  # re-assert anything that genuinely came from the caller's environment
+  for _k in "${!_CALLER_ENV[@]}"; do
+    printf -v "$_k" '%s' "${_CALLER_ENV[$_k]}"
   done
   : "${DISK_FILE:=$DROIDEUM_HOME/android.img}"
-  : "${ISO_FILE:=$CACHE_DIR/$_iso_name}"
+  _derive_iso_file
 
   if [ -z "$RAM_MB" ]; then
     local total_mb
@@ -133,7 +145,14 @@ need_qemu() {
 
 # --- adb helpers -------------------------------------------------------------
 ADB_BIN="${ADB_BIN:-adb}"
-adb_() { "$ADB_BIN" "$@" 2>&1; }
+adb_() {
+  case "${1:-}" in
+    devices|connect|disconnect|start-server|kill-server|version)
+      "$ADB_BIN" "$@" 2>&1 ;;
+    *)
+      "$ADB_BIN" -s "127.0.0.1:$ADB_PORT" "$@" 2>&1 ;;
+  esac
+}
 
 adb_online() {
   command -v "$ADB_BIN" >/dev/null 2>&1 || return 1
@@ -162,6 +181,7 @@ vm_pid() {
 #  commands
 # =============================================================================
 cmd_setup() {
+  load_config
   step "1/3  Checking host engine"
   if command -v qemu-system-x86_64 >/dev/null 2>&1; then
     ok "qemu-system-x86_64 $(qemu-system-x86_64 --version | head -1 | awk '{print $4}')"
@@ -225,9 +245,11 @@ EOF
 kvm_usable() {
   [ "$USE_KVM" = "never" ] && return 1
   [ -r /dev/kvm ] && [ -w /dev/kvm ] || return 1
-  # A device node that exists but cannot be opened is worse than none: probe it.
+  # A device node that exists but cannot create a VM is worse than none: probe it
+  # via an immediate HMP 'quit' so real KVM exits 0 and broken /dev/kvm exits 1.
   if command -v qemu-system-x86_64 >/dev/null 2>&1; then
-    qemu-system-x86_64 -accel kvm -machine none -display none -nodefaults 2>/dev/null version >/dev/null 2>&1
+    printf 'quit\n' | qemu-system-x86_64 -accel kvm -machine none -display none \
+      -nodefaults -monitor stdio >/dev/null 2>&1
   fi
 }
 
@@ -371,9 +393,9 @@ _launch() {
 
   info "$title"
   say "${C_D}qemu-system-x86_64 ${args[*]}${C_R}"
-  nohup qemu-system-x86_64 "${args[@]}" >>"$QEMU_LOG" 2>&1 &
+  nohup qemu-system-x86_64 "${args[@]}" >>"$QEMU_LOG" 2>&1 </dev/null &
   echo $! > "$PID_FILE"
-  sleep 2
+  sleep "$LAUNCH_WAIT"
   if ! vm_pid >/dev/null; then
     tail -20 "$QEMU_LOG" >&2 || true
     die "QEMU exited immediately — see $QEMU_LOG"
@@ -448,9 +470,22 @@ cmd_start() {
   LOADVM="$loadvm" _launch "$title" -drive "$(_drive)" -boot c
 }
 
+# Wait up to $2 seconds for process $1 to exit, polling every 0.2s.
+_wait_pid_exit() {
+  local pid="$1" limit_s="$2" ticks=0 max_ticks=$(( $2 * 5 ))
+  local log_progress="${3:-0}"
+  while [ "$ticks" -lt "$max_ticks" ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 0.2
+    ticks=$((ticks + 1))
+    if [ "$log_progress" -eq 1 ] && [ $((ticks % 100)) -eq 0 ]; then
+      info "waiting for Android to power off ($((ticks / 5))s / ${limit_s}s)"
+    fi
+  done
+  ! kill -0 "$pid" 2>/dev/null
+}
+
 # Shut down in the order that keeps the ext4 image clean, because a dirty image
 # turns every later boot into a multi-minute fsck under TCG.
-_dirty_flag="$RUN_DIR/dirty"
 shutdown_vm() {
   local graceful_timeout="${1:-90}"
   local pid; pid=$(cat "$PID_FILE" 2>/dev/null || true)
@@ -472,28 +507,24 @@ shutdown_vm() {
     say "  ${C_D}no adb: assuming a non-Android guest, so only waiting ${quick}s for ACPI${C_R}"
   fi
 
-  local waited=0
-  while [ "$waited" -lt "$graceful_timeout" ] && kill -0 "$pid" 2>/dev/null; do
-    sleep 2; waited=$((waited + 2))
-    [ $((waited % 20)) -eq 0 ] && info "waiting for Android to power off (${waited}s)"
-  done
+  _wait_pid_exit "$pid" "$graceful_timeout" 1 || true
 
   if kill -0 "$pid" 2>/dev/null; then
     warn "ACPI shutdown did not finish; asking QEMU to quit"
     monitor_cmd "quit" >/dev/null 2>&1 || true
-    for _ in $(seq 1 10); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+    _wait_pid_exit "$pid" 10 0 || true
   fi
 
   if kill -0 "$pid" 2>/dev/null; then
     warn "QEMU ignored quit; sending SIGTERM"
     kill "$pid" 2>/dev/null || true
-    for _ in $(seq 1 5); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+    _wait_pid_exit "$pid" 5 0 || true
   fi
 
   if kill -0 "$pid" 2>/dev/null; then
     warn "SIGKILL (the disk may need fsck on next boot)"
     kill -9 "$pid" 2>/dev/null || true
-    sleep 1
+    _wait_pid_exit "$pid" 2 0 || true
   fi
   rm -f "$PID_FILE" "$MON_SOCK"
 }
@@ -531,7 +562,8 @@ cmd_suspend() {
     die "suspend failed — the disk may need more free space (droideum resize 4G)"
   fi
   monitor_cmd "quit" >/dev/null 2>&1 || true
-  for _ in $(seq 1 30); do vm_pid >/dev/null || break; sleep 1; done
+  local pid; pid=$(cat "$PID_FILE" 2>/dev/null || true)
+  [ -n "${pid:-}" ] && _wait_pid_exit "$pid" 30 0 || true
   if vm_pid >/dev/null; then shutdown_vm 20; fi
   rm -f "$PID_FILE" "$MON_SOCK"
   local took=$(( $(date +%s) - t0 ))
@@ -561,14 +593,15 @@ cmd_resume() {
   # adb is a bonus, not a requirement: a generic guest (Alpine, a Linux image you
   # booted yourself) has no adbd at all, and waiting minutes for it is a lie.
   local budget="${RESUME_ADB_TIMEOUT:-20}"
-  adb connect "127.0.0.1:$ADB_PORT" >/dev/null 2>&1 || true
-  local waited=0
-  while [ "$waited" -lt "$budget" ]; do
+  "$ADB_BIN" connect "127.0.0.1:$ADB_PORT" >/dev/null 2>&1 || true
+  local ticks=0 max_ticks=$((budget * 2))
+  while [ "$ticks" -lt "$max_ticks" ]; do
     if adb_online; then
       ok "state '${name}' restored in $(( $(date +%s) - t0 ))s and adb is connected"
       return 0
     fi
-    sleep 1; waited=$((waited + 1))
+    "$ADB_BIN" connect "127.0.0.1:$ADB_PORT" >/dev/null 2>&1 || true
+    sleep 0.5; ticks=$((ticks + 1))
   done
   ok "state '${name}' restored in $(( $(date +%s) - t0 ))s — the guest is running exactly where it was"
   say "  ${C_D}adb did not answer within ${budget}s. For Android that usually just needs 'droideum adbconnect';"
@@ -627,14 +660,69 @@ cmd_res() {
 }
 
 # --- app-sideboarding --------------------------------------------------------
+_report_install_error() {
+  local out="$1"
+  printf '%s\n' "$out" >&2
+  case "$out" in
+    *NO_MATCHING_ABIS*) warn "this APK ships only native ARM code. Fix: 'droideum armbridge' (installs the ARM translation layer), then retry." ;;
+    *INSUFFICIENT_STORAGE*) warn "grow the disk: droideum resize 24G" ;;
+    *INSTALL_FAILED_VERSION_DOWNGRADE*) warn "uninstall the existing copy first: droideum apk uninstall <package>" ;;
+  esac
+}
+
+apk_install_bundle() {
+  local bundle="$1"
+  command -v unzip >/dev/null 2>&1 || die "unzip missing inside container — run 'droideum setup'"
+  local tmpd; tmpd=$(mktemp -d)
+  info "extracting split APK bundle $(basename "$bundle") ..."
+  if ! unzip -q "$bundle" '*.apk' -d "$tmpd" 2>/dev/null; then
+    rm -rf "$tmpd"
+    die "bundle $(basename "$bundle") contains no .apk splits"
+  fi
+  local -a all_splits=() chosen=()
+  local s bn has_x86=0
+  while IFS= read -r s; do
+    all_splits+=("$s")
+    bn=$(basename "$s")
+    case "$bn" in *x86_64*|*x86*) has_x86=1 ;; esac
+  done < <(find "$tmpd" -type f -name '*.apk' | sort)
+
+  if [ "${#all_splits[@]}" -eq 0 ]; then
+    rm -rf "$tmpd"
+    die "no .apk files found inside $(basename "$bundle")"
+  fi
+
+  # When a bundle contains both x86_64/x86 and arm64/armeabi ABI splits, drop
+  # the foreign ARM ABI splits so `adb install-multiple` does not reject them.
+  for s in "${all_splits[@]}"; do
+    bn=$(basename "$s")
+    if [ "$has_x86" -eq 1 ]; then
+      case "$bn" in
+        *arm64_v8a*|*arm64-v8a*|*armeabi_v7a*|*armeabi-v7a*|*armeabi.apk) continue ;;
+      esac
+    fi
+    chosen+=("$s")
+  done
+
+  info "installing ${#chosen[@]} split APK(s) from $(basename "$bundle") ..."
+  local out
+  out=$(adb_ install-multiple -r -g -d "${chosen[@]}")
+  rm -rf "$tmpd"
+  if grep -qi success <<<"$out"; then
+    ok "$(basename "$bundle") installed (${#chosen[@]} splits)"
+    return 0
+  fi
+  _report_install_error "$out"
+  return 1
+}
+
 apk_install_one() {
   local f="$1"
   [ -f "$f" ] || die "no such file: $f"
-  case "$f" in *.apk|*.apks|*.xapk|*.apkm) ;; *) die "not an apk: $f" ;; esac
   case "$f" in
-    *.apks|*.xapk|*.apkm)
-      warn "split bundles are not supported by plain 'adb install' — rebuild as a single APK or use 'adb install-multiple'"
-      return 1 ;;
+    *.apks|*.xapk|*.apkm) apk_install_bundle "$f"; return $? ;;
+    *.apk) ;;
+    *) die "not an apk or split bundle (.apk|.apks|.xapk|.apkm): $f" ;;
   esac
   info "installing $(basename "$f") ..."
   local out
@@ -642,12 +730,7 @@ apk_install_one() {
   if grep -qi success <<<"$out"; then
     ok "$(basename "$f") installed"
   else
-    printf '%s\n' "$out" >&2
-    case "$out" in
-      *NO_MATCHING_ABIS*) warn "this APK ships only native ARM code. Fix: 'droideum armbridge' (installs the ARM translation layer), then retry." ;;
-      *INSUFFICIENT_STORAGE*) warn "grow the disk: droideum resize 24G" ;;
-      *INSTALL_FAILED_VERSION_DOWNGRADE*) warn "uninstall the existing copy first: droideum apk uninstall <package>" ;;
-    esac
+    _report_install_error "$out"
     return 1
   fi
 }
@@ -798,9 +881,9 @@ cmd_live() {
   info "at the boot menu press Tab and append: console=ttyS0,115200   (then Enter)"
   local args
   mapfile -t args < <(_qemu_common; _display_args; printf '%s\n' -cdrom "$ISO_FILE" -boot d)
-  nohup qemu-system-x86_64 "${args[@]}" >>"$QEMU_LOG" 2>&1 &
+  nohup qemu-system-x86_64 "${args[@]}" >>"$QEMU_LOG" 2>&1 </dev/null &
   echo $! > "$PID_FILE"
-  sleep 2
+  sleep "$LAUNCH_WAIT"
   vm_pid >/dev/null || { tail -20 "$QEMU_LOG" >&2; die "QEMU exited immediately"; }
   ok "live VM running (pid $(cat "$PID_FILE")) — no disk attached"
   say "  ${C_D}next: droideum console bridge   (in another shell)${C_R}"
@@ -881,7 +964,9 @@ cmd_up() {
     fi
     if [ "$resume" = "yes" ] && vm_has_snapshot "$AUTOSAVE_NAME"; then
       info "saved state found — waking instead of booting (much faster)"
-      RESUME_BACKEND="${want_display:+$DISPLAY_BACKEND}" cmd_resume "$AUTOSAVE_NAME" || true
+      local res_backend="none"
+      [ "$want_display" -eq 1 ] && res_backend="$DISPLAY_BACKEND"
+      RESUME_BACKEND="$res_backend" cmd_resume "$AUTOSAVE_NAME" || true
     else
       if ! disk_has_boot_sector; then
         die "no installed Android on the disk — run 'droideum install' first (this is not a boot timeout)"
@@ -899,19 +984,19 @@ cmd_up() {
 
   info "waiting for Android to finish booting (first boot under TCG can take 20 min)"
   local waited=0 limit="${BOOT_TIMEOUT:-1500}"
-  if ! command -v adb >/dev/null 2>&1; then
+  if ! command -v "$ADB_BIN" >/dev/null 2>&1; then
     warn "adb missing inside the container; cannot confirm boot. droideum setup installs it."
     return 1
   fi
-  adb connect "127.0.0.1:$ADB_PORT" >/dev/null 2>&1 || true
   while [ "$waited" -lt "$limit" ]; do
+    "$ADB_BIN" connect "127.0.0.1:$ADB_PORT" >/dev/null 2>&1 || true
     local bc
-    bc=$(adb -s "127.0.0.1:$ADB_PORT" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+    bc=$(adb_ shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
     if [ "$bc" = "1" ]; then
       ok "Android is up and reachable on 127.0.0.1:$ADB_PORT (after ${waited}s)"
       if [ "$do_tune" -eq 1 ]; then cmd_tune; else
         local anim
-        anim=$(adb -s "127.0.0.1:$ADB_PORT" shell settings get global window_animation_scale 2>/dev/null | tr -d '\r')
+        anim=$(adb_ shell settings get global window_animation_scale 2>/dev/null | tr -d '\r')
         if [ "${anim:-1}" != "0" ]; then
           say "  ${C_D}animations are still on — 'droideum up --tune' makes agent loops ~30% faster${C_R}"
         fi
@@ -919,8 +1004,10 @@ cmd_up() {
       say "  next: droideum agent serve --autostart    ${C_D}# MCP tool server for your agent${C_R}"
       return 0
     fi
-    sleep 5; waited=$((waited + 5))
-    [ $((waited % 60)) -eq 0 ] && info "still booting... ${waited}s"
+    local step_s=5
+    [ "$waited" -lt 5 ] && step_s=1
+    sleep "$step_s"; waited=$((waited + step_s))
+    [ "$waited" -ge 60 ] && [ $((waited % 60)) -eq 0 ] && info "still booting... ${waited}s"
   done
   warn "boot did not complete in ${limit}s — check 'droideum log'"
   return 1
@@ -940,7 +1027,7 @@ cmd_agent() {
       local client="${1:-generic}"
       local self_path; self_path=$(command -v droideum 2>/dev/null || echo "droideum")
       case "$client" in
-        claude|claude-desktop|claude-code)
+        claude|claude-desktop|claude-code|cursor|gemini)
           cat <<EOF
 {
   "mcpServers": {
@@ -952,7 +1039,7 @@ cmd_agent() {
 }
 EOF
           say ""
-          say "${C_D}Claude Desktop: merge into claude_desktop_config.json${C_R}"
+          say "${C_D}Claude / Cursor / Gemini CLI: merge into your MCP JSON config${C_R}"
           say "${C_D}Claude Code   : claude mcp add droideum-android -- $self_path agent serve --autostart${C_R}" ;;
         codex|openai)
           cat <<EOF
@@ -1032,21 +1119,46 @@ cmd_resize() {
 }
 
 cmd_snapshot() {
-  load_config
-  vm_pid >/dev/null && die "stop the VM before snapshotting (or use 'droideum snapshot --live')"
+  load_config; need_qemu
+  if [ "${1:-}" = "rm" ] || [ "${1:-}" = "delete" ]; then
+    local target="${2:-}"
+    [ -n "$target" ] || die "usage: droideum snapshot rm <name>"
+    vm_pid >/dev/null && die "stop the VM before deleting snapshots"
+    [ -f "$SNAP_DIR/$target.qcow2" ] || die "no snapshot $target"
+    if qemu-img info "$DISK_FILE" 2>/dev/null | grep -qF "$target.qcow2"; then
+      die "cannot delete '$target': $DISK_FILE is currently backed by it (restore another snapshot first)"
+    fi
+    rm -f "$SNAP_DIR/$target.qcow2"
+    ok "deleted snapshot: $target"
+    return 0
+  fi
+  vm_pid >/dev/null && die "stop the VM before snapshotting (or use 'droideum suspend' for live RAM+disk state)"
+  [ -f "$DISK_FILE" ] || die "no disk found ($DISK_FILE) — run 'droideum setup'"
   local name="${1:-snap-$(date +%Y%m%d-%H%M%S)}"
-  qemu-img create -f qcow2 -b "$DISK_FILE" -F qcow2 "$SNAP_DIR/$name.qcow2" >/dev/null
-  ok "snapshot created: $SNAP_DIR/$name.qcow2"
-  say "restore with: droideum restore $name"
+  mkdir -p "$SNAP_DIR"
+  if [ ! -f "$SNAP_DIR/$name.qcow2" ]; then
+    mv -f "$DISK_FILE" "$SNAP_DIR/$name.qcow2"
+  else
+    qemu-img convert -f qcow2 -O qcow2 "$DISK_FILE" "$SNAP_DIR/$name.new.qcow2" >/dev/null
+    mv -f "$SNAP_DIR/$name.new.qcow2" "$SNAP_DIR/$name.qcow2"
+    rm -f "$DISK_FILE"
+  fi
+  if ! qemu-img create -f qcow2 -b "$SNAP_DIR/$name.qcow2" -F qcow2 "$DISK_FILE" >/dev/null; then
+    [ ! -f "$DISK_FILE" ] && [ -f "$SNAP_DIR/$name.qcow2" ] && mv -f "$SNAP_DIR/$name.qcow2" "$DISK_FILE"
+    die "failed to create CoW overlay from snapshot $name"
+  fi
+  ok "snapshot created: $SNAP_DIR/$name.qcow2 (active disk is now a fast CoW overlay)"
+  say "restore anytime with: droideum restore $name"
 }
 
 cmd_restore() {
-  load_config
+  load_config; need_qemu
   local name="${1:-}"; [ -n "$name" ] || die "usage: droideum restore <snapshot-name>   (see droideum snapshots)"
   vm_pid >/dev/null && die "stop the VM first"
   [ -f "$SNAP_DIR/$name.qcow2" ] || die "no snapshot $name"
-  cp -f "$SNAP_DIR/$name.qcow2" "$DISK_FILE"
-  ok "restored $name -> $DISK_FILE"
+  rm -f "$DISK_FILE"
+  qemu-img create -f qcow2 -b "$SNAP_DIR/$name.qcow2" -F qcow2 "$DISK_FILE" >/dev/null
+  ok "restored $name -> $DISK_FILE (fresh CoW overlay; '$name' remains intact)"
 }
 
 cmd_snapshots() {
@@ -1092,7 +1204,14 @@ cmd_tune() {
   adb_ shell svc power stayon true >/dev/null 2>&1 || true
   adb_ shell locksettings set-disabled true >/dev/null 2>&1 || warn "could not disable the lock screen (needs no screen lock set)"
   adb_ shell "logcat -G 4M" >/dev/null 2>&1 || true
-  ok "animations off, screen always on, lock screen disabled, 4 MB logcat buffer"
+  if [ "${FAST_BOOT:-1}" = "1" ]; then
+    # Under QEMU TCG, full AOT dex2oat compilation during APK install or idle
+    # takes 10-20 minutes and triggers guest OOM kills. Switch to verify-only.
+    adb_ shell setprop pm.dexopt.install verify >/dev/null 2>&1 || true
+    adb_ shell setprop dalvik.vm.dex2oat-filter verify >/dev/null 2>&1 || true
+    adb_ shell cmd package bg-dexopt-job --disable >/dev/null 2>&1 || true
+  fi
+  ok "animations off, screen always on, lock screen disabled, fast TCG dexopt, 4 MB logcat buffer"
 
   if [ -n "$install_kb" ]; then
     [ -f "$install_kb" ] || die "no such file: $install_kb"
@@ -1112,6 +1231,14 @@ cmd_tune() {
 }
 
 # --- benchmark --------------------------------------------------------------
+_now_ms() {
+  local raw; raw=$(date +%s%3N 2>/dev/null || true)
+  case "$raw" in
+    *[!0-9]*|"") python3 -c 'import time; print(int(time.time()*1000))' ;;
+    *) printf '%s\n' "$raw" ;;
+  esac
+}
+
 # Numbers you can act on: per-step latency of the operations an agent loop repeats.
 cmd_bench() {
   load_config; adb_connect
@@ -1122,16 +1249,16 @@ cmd_bench() {
   local round
   for ((round = 1; round <= rounds; round++)); do
     local t0 t1
-    t0=$(date +%s%3N); adb_ shell uiautomator dump /sdcard/bench.xml >/dev/null 2>&1 || true
-    t1=$(date +%s%3N); dump_ms=$((dump_ms + t1 - t0))
+    t0=$(_now_ms); adb_ shell uiautomator dump /sdcard/bench.xml >/dev/null 2>&1 || true
+    t1=$(_now_ms); dump_ms=$((dump_ms + t1 - t0))
 
-    t0=$(date +%s%3N); cap_bytes=$(adb_ exec-out screencap -p 2>/dev/null | wc -c)
-    t1=$(date +%s%3N); cap_ms=$((cap_ms + t1 - t0))
+    t0=$(_now_ms); cap_bytes=$(adb_ exec-out screencap -p 2>/dev/null | wc -c | tr -d ' ')
+    t1=$(_now_ms); cap_ms=$((cap_ms + t1 - t0))
 
     local geom w h
-    geom=$(adb_ shell wm size | tr -d '\r' | grep -o '[0-9]*x[0-9]*' | head -1)
+    geom=$(adb_ shell wm size | tr -d '\r' | grep -o '[0-9]*x[0-9]*' | tail -1)
     w=${geom%x*}; h=${geom#*x}
-    t0=$(date +%s%3N)
+    t0=$(_now_ms)
     adb_ shell input tap $((w / 2)) $((h / 2)) >/dev/null 2>&1 || true
     # settle = two consecutive identical dumps
     local prev="" cur="" n=0
@@ -1140,7 +1267,7 @@ cmd_bench() {
       [ -n "$prev" ] && [ "$cur" = "$prev" ] && break
       prev="$cur"; n=$((n + 1))
     done
-    t1=$(date +%s%3N); tap_ms=$((tap_ms + t1 - t0))
+    t1=$(_now_ms); tap_ms=$((tap_ms + t1 - t0))
   done
 
   local d=$((dump_ms / rounds)) c=$((cap_ms / rounds)) t=$((tap_ms / rounds))
@@ -1155,7 +1282,7 @@ cmd_bench() {
   local out
   out="$LOG_DIR/bench-$(date +%Y%m%d-%H%M%S).json"
   printf '{"dump_ms":%s,"capture_ms":%s,"capture_bytes":%s,"tap_settle_ms":%s,"screen":"%s","cores":%s,"ram_mb":%s}\n' \
-    "$d" "$c" "$cap_bytes" "$t" "$(adb_ shell wm size | tr -d '\r' | grep -o '[0-9]*x[0-9]*' | head -1)" \
+    "$d" "$c" "$cap_bytes" "$t" "$(adb_ shell wm size | tr -d '\r' | grep -o '[0-9]*x[0-9]*' | tail -1)" \
     "$CORES" "$RAM_MB" > "$out"
   ok "saved $out"
 }
@@ -1204,8 +1331,8 @@ cmd_profile() {
       [ -n "$name" ] || die "usage: droideum profile use android9|android9-lite|bliss14|custom"
       local url sha ram extra="" tb=""
       case "$name" in
-        android9)      url="$ISO_URL"; sha="$ISO_SHA1"; ram=2048 ;;
-        android9-lite) url="$ISO_URL"; sha="$ISO_SHA1"; ram=1536
+        android9)      url="$DEFAULT_ISO_URL"; sha="$DEFAULT_ISO_SHA1"; ram=2048 ;;
+        android9-lite) url="$DEFAULT_ISO_URL"; sha="$DEFAULT_ISO_SHA1"; ram=1536
                        extra="-device virtio-vga"; tb=32 ;;
         bliss14)       url="https://sourceforge.net/projects/blissos-dev/files/Beta/Bliss-v14.10-x86_64-OFFICIAL-foss-20230310.iso"
                        sha="skip"; ram=3072 ;;
@@ -1347,8 +1474,8 @@ ${C_B}ONE-TIME${C_R}
 
 ${C_B}FOR AI AGENTS${C_R}  (no VNC, no tapping — machine-readable control)
   droideum up                    headless boot + block until Android answers adb
-  droideum agent serve --autostart   MCP tool server on stdio (26 tools)
-  droideum agent config claude   print the MCP client snippet
+  droideum agent serve --autostart   MCP tool server on stdio (30 tools)
+  droideum agent config claude   print the MCP client snippet (claude|codex|cursor|gemini)
   droideum agent tool            list agent tools with one-line descriptions
   droideum agent observe         human-readable screen + UI tree right now
   droideum agent call ui.find --json '{"query":"Sign in"}'

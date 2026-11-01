@@ -1,7 +1,7 @@
 # droideum
 
 [![ci](https://github.com/lorenzz20105-del/droideum-termux/actions/workflows/ci.yml/badge.svg)](https://github.com/lorenzz20105-del/droideum-termux/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/droideum-1.3.0-blue)]()
+[![version](https://img.shields.io/badge/droideum-1.4.0-blue)]()
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platform](https://img.shields.io/badge/runs%20in-Termux%20(proot%20aarch64)-black)]()
 [![root](https://img.shields.io/badge/root-not%20required-success)]()
@@ -13,8 +13,8 @@ Give your agent a phone. It observes a compact, coordinate-annotated UI tree, ta
 user, installs APKs, reads logcat, and can checkpoint/rollback the whole device state.
 
 ```
-your agent ──MCP stdio──▶ droideum-agentd ──adb──▶ Android 9 VM (QEMU/TGC)
-                          26 tools                    inside proot aarch64
+your agent ──MCP stdio──▶ droideum-agentd ──adb──▶ Android 9 VM (QEMU/TCG)
+                          30 tools + 3 resources      inside proot aarch64
 ```
 
 ---
@@ -128,10 +128,11 @@ droideum up --tune        # boot + tune in one step
 droideum tune             # re-apply later (idempotent)
 ```
 
-Sets `window/transition/animator` scales to 0, screen always on, lock screen disabled, 4 MB logcat
-buffer. Every `wait.idle` and every `observe` after a tap stops waiting for a 300 ms animation that
-carries no information. `droideum tune --keyboard ADBKeyboard.apk` additionally installs the
-broadcast IME, which lifts the ASCII-only limit on typed text.
+Sets `window/transition/animator` scales to 0, screen always on, lock screen disabled, verify-only
+`dex2oat` package installs (preventing 15-minute TCG compilation stalls), and a 4 MB logcat buffer.
+Every `wait.idle` and every `observe` after a tap stops waiting for a 300 ms animation that carries no
+information. `droideum tune --keyboard ADBKeyboard.apk` additionally installs the broadcast IME so
+`input.text` seamlessly types Unicode via `ADB_INPUT_B64`.
 
 ### Measure it, don't guess
 
@@ -162,24 +163,30 @@ latency, the other two stop the qcow2 from growing forever as apps are installed
 
 ---
 
-## Agent tools (26)
+## Agent tools (30) + MCP resources (3)
 
-Perception first — every observation is small, stable and self-describing.
+Perception first — every observation is small, stable and self-describing, with `ui_hash` and
+`screen_changed` delta flags so the model immediately knows whether an action changed the screen.
 
 | Tool | What the agent uses it for |
 |---|---|
 | `device.status` | VM/adb/boot state, Android version, ABI list, screen, foreground app, free space |
-| `observe` | **one round trip**: foreground + compact UI tree (+ optional PNG) |
-| `ui.dump` | full compact tree; layout frames dropped, `xy` tap centres precomputed |
+| `observe` | **one round trip**: foreground + compact UI tree + `screen_changed` (+ optional PNG) |
+| `ui.dump` | full compact tree; layout frames dropped, `xy` tap centres precomputed, `ui_hash` |
 | `ui.find` | text/desc/id → tap coordinates (≈10× cheaper than a dump) |
+| `ui.tap_match` | **one-step find + tap**: waits up to `wait_s` for text/desc/id and taps its centre |
+| `ui.wait_for` | block until a specific UI node appears (or disappears when `gone=true`) |
 | `screen.capture` | PNG for vision models when the tree is empty (games, SurfaceViews) |
-| `input.tap` / `long_press` / `swipe` / `text` / `key` | act on the device, bounds-checked, single-flighted |
+| `input.tap` / `long_press` / `swipe` / `text` / `key` | act on the device, bounds-checked, single-flighted (`text` supports `clear_first`, `submit`, and Unicode via `ADBKeyboard`) |
 | `wait.idle` | block until the UI stops changing — replaces brittle sleeps |
-| `app.install` / `launch` / `stop` / `clear_data` / `list` / `current` | app lifecycle |
-| `device.tune` | animations off, screen always on, lock screen off, bigger logcat — makes later steps faster |
+| `app.install` / `launch` / `intent` / `stop` / `clear_data` / `list` / `current` | app lifecycle, split bundles (`.apks`/`.xapk`/`.apkm`), and deep-link/URL `Intent` dispatch |
+| `device.tune` / `clipboard` | animations off + TCG fast-dexopt; read/set Android clipboard |
 | `device.reset` | known-good state cheaply: force-stop all, clear one app, relaunch |
 | `task.checkpoint` / `rollback` / `snapshots` | save/restore **RAM + disk** (QEMU `savevm`) |
 | `logcat.tail`, `shell.exec`, `file.push`/`pull` | triage, escape hatch, artifacts in/out |
+
+Live MCP resources (`resources/list` & `resources/read`): `droideum://status`, `droideum://ui`, and
+`droideum://logcat`.
 
 Design notes that matter for agent reliability:
 

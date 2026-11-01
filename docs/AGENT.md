@@ -79,7 +79,11 @@ Agents pay for tokens and lose accuracy on noise. `ui.dump` therefore:
 - **short keys only** (`text`, `desc`, `id`, `cls`) — no attributes an agent can't use
 - returns `foreground` inline, so one call answers "where am I?"
 
-`ui.find` is the cheaper path: ask for `"Sign in"` and get `center: [540,540]` back, no tree.
+`ui.find` is the cheaper path: ask for `"Sign in"` and get `center: [540,540]` back, no tree. Even
+better, `ui.tap_match` combines `ui.find` + `input.tap` (with a short wait for loading screens) into a
+single round-trip, and `ui.wait_for` blocks until a target element appears (or disappears when
+`gone: true`, e.g. waiting for a `"Loading…"` spinner to clear). Every `ui.dump` and `observe` also
+returns `ui_hash` and `screen_changed` (`true`/`false`), so the model detects no-op taps immediately.
 
 When the tree is useless (games, Flutter/Unity SurfaceViews, DRM surfaces) the fallback is explicit:
 `screen.capture` returns a real PNG (MCP image content) for a vision model, and coordinates are tapped
@@ -179,8 +183,8 @@ Rules of thumb that keep an agent loop cheap:
 
 ```bash
 droideum agent selftest        # parsers, schemas, escaping — no device needed
-python3 test/mcp-test.py       # 66 assertions: MCP contract + a full stubbed agent loop
-STUB_ADB=1 python3 test/mcp-test.py   # + fake adb: observe→find→tap→wait→launch
+python3 test/mcp-test.py       # offline MCP contract + strict JSON Schema checks
+STUB_ADB=1 python3 test/mcp-test.py   # 99 assertions: full stubbed 30-tool + resource loop
 ```
 
 The stub test proves the loop end to end offline: a fake `adb` returns a canned accessibility dump, and

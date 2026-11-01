@@ -103,23 +103,44 @@ def smoke():
 # ---------------------------------------------------------------------------
 TOOL_SPECS = [
     ("device.status", "Device health: VM/adb/boot, Android version, ABI list, screen, foreground app.", {}),
-    ("observe", "One-shot perception: foreground app + compact UI tree with tap coordinates.",
+    ("observe", "One-shot perception: foreground app + compact UI tree with tap coordinates and screen_changed flag.",
      {"only_interactive": {"type": "boolean"}, "include_screenshot": {"type": "boolean"}}),
     ("ui.find", "Find a UI element by text/desc/id; returns tap coordinates.",
      {"query": {"type": "string"}, "by": {"type": "string", "enum": ["any", "text", "desc", "id"]}},
      ["query"]),
+    ("ui.tap_match", "Find a UI element by text/desc/id and tap its center in one step.",
+     {"query": {"type": "string"}, "by": {"type": "string", "enum": ["any", "text", "desc", "id"]},
+      "index": {"type": "integer"}, "wait_s": {"type": "number"}},
+     ["query"]),
+    ("ui.wait_for", "Block until a matching UI element appears (or disappears when gone=true).",
+     {"query": {"type": "string"}, "by": {"type": "string", "enum": ["any", "text", "desc", "id"]},
+      "gone": {"type": "boolean"}, "timeout_s": {"type": "number"}},
+     ["query"]),
     ("input.tap", "Tap device pixel coordinates.", {"x": {"type": "integer"}, "y": {"type": "integer"}},
      ["x", "y"]),
-    ("input.text", "Type ASCII text into the focused field.", {"text": {"type": "string"}}, ["text"]),
+    ("input.text", "Type text into the focused field.",
+     {"text": {"type": "string"}, "clear_first": {"type": "boolean"}, "submit": {"type": "boolean"}},
+     ["text"]),
     ("input.key", "Send a key: BACK, HOME, ENTER, DPAD_*, APP_SWITCH.", {"key": {"type": "string"}}, ["key"]),
     ("input.swipe", "Swipe/scroll between two points.",
      {"x1": {"type": "integer"}, "y1": {"type": "integer"}, "x2": {"type": "integer"},
       "y2": {"type": "integer"}, "ms": {"type": "integer"}}, ["x1", "y1", "x2", "y2"]),
     ("app.launch", "Launch an app by package name.", {"package": {"type": "string"}}, ["package"]),
+    ("app.intent", "Open a URL, deep link, or Android Intent action.",
+     {"action": {"type": "string"}, "uri": {"type": "string"}, "package": {"type": "string"}}, []),
     ("app.list", "List installed third-party packages.", {}),
     ("wait.idle", "Block until the UI stops changing.", {"timeout_s": {"type": "number"}}),
     ("logcat.tail", "Recent logcat lines.", {"lines": {"type": "integer"}, "filter": {"type": "string"}}),
 ]
+
+
+def _to_fn_name(tool_name):
+    """OpenAI /chat/completions requires function names matching ^[a-zA-Z0-9_-]+$."""
+    return tool_name.replace(".", "__")
+
+
+def _from_fn_name(fn_name):
+    return fn_name.replace("__", ".")
 
 
 def openai_tools():
@@ -128,7 +149,7 @@ def openai_tools():
         name, desc, props = spec[0], spec[1], spec[2]
         required = spec[3] if len(spec) > 3 else []
         out.append({"type": "function",
-                    "function": {"name": name, "description": desc,
+                    "function": {"name": _to_fn_name(name), "description": desc,
                                  "parameters": {"type": "object", "properties": props,
                                                 "required": required}}})
     return out
@@ -150,8 +171,8 @@ def llm(goal, model=None, max_steps=15):
     messages = [
         {"role": "system", "content":
             "You control an Android device through tools. Coordinates are device pixels and must come "
-            "from observe/ui.find — never guess. After an action, call wait.idle then observe to "
-            "verify. Be concise; stop as soon as the goal's success condition is visible."},
+            "from observe/ui__find — never guess. Prefer ui__tap_match to find-and-tap in one step, and "
+            "check screen_changed in observe. Be concise; stop as soon as the goal is met."},
         {"role": "user", "content": goal},
     ]
 
@@ -171,7 +192,8 @@ def llm(goal, model=None, max_steps=15):
             return 0
 
         for call in msg["tool_calls"]:
-            name = call["function"]["name"]
+            raw_name = call["function"]["name"]
+            name = _from_fn_name(raw_name)
             try:
                 args = json.loads(call["function"].get("arguments") or "{}")
             except json.JSONDecodeError:

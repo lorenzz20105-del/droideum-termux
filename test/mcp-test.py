@@ -108,9 +108,11 @@ STUB_ADB = textwrap.dedent('''\
     elif "getprop" in joined:
         print("")
     elif "wm size" in joined:
-        print("Physical size: 1080x2340")
+        print("Physical size: 1920x1080")
+        print("Override size: 1080x2340")
     elif "wm density" in joined:
-        print("Physical density: 440")
+        print("Physical density: 320")
+        print("Override density: 440")
     elif "mCurrentFocus" in joined:
         print("  mCurrentFocus=Window{1a2b3c u0 com.example.app/com.example.app.MainActivity}")
     elif "uiautomator dump" in joined:
@@ -120,6 +122,26 @@ STUB_ADB = textwrap.dedent('''\
     elif "exec-out screencap" in joined:
         sys.stdout.buffer.write(base64.b64decode(
             b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="))
+    elif "ime list" in joined:
+        ime_flag = os.path.join(os.environ.get("DROIDEUM_HOME", ""), "enable_adb_ime")
+        if os.path.exists(ime_flag):
+            print("com.android.adbkeyboard/.AdbIME")
+    elif "ADB_INPUT_B64" in joined:
+        print("Broadcasting: Intent { act=ADB_INPUT_B64 }")
+    elif "cmd clipboard set-primary-clip" in joined:
+        clip_file = os.path.join(os.environ.get("DROIDEUM_HOME", ""), "clip.txt")
+        with open(clip_file, "w") as fh:
+            fh.write(args[-1].split("set-primary-clip ", 1)[-1].strip("'\\""))
+    elif "cmd clipboard get-primary-clip" in joined:
+        clip_file = os.path.join(os.environ.get("DROIDEUM_HOME", ""), "clip.txt")
+        print(open(clip_file).read() if os.path.exists(clip_file) else "")
+    elif "install-multiple" in joined or " install " in joined:
+        print("Performing Streamed Install")
+        print("Success")
+    elif "am start " in joined:
+        print("Starting: Intent { ... }")
+    elif "logcat -d" in joined:
+        print("11-01 12:00:00.000 I/ActivityManager( 1000): Displayed com.example.app/.MainActivity")
     elif "settings get global window_animation_scale" in joined:
         print("0")
     elif "settings get" in joined:
@@ -155,15 +177,47 @@ def offline_tests():
     c.rpc("notifications/initialized", notify=True)
     tools = c.rpc("tools/list")["result"]["tools"]
     names = [t["name"] for t in tools]
-    check("tools/list returns the catalogue", len(tools) >= 20, str(len(tools)))
-    for expected in ("observe", "ui.dump", "ui.find", "input.tap", "input.text",
-                     "app.launch", "wait.idle", "task.checkpoint", "task.rollback"):
+    check("tools/list returns all 30 tools", len(tools) == 30, str(len(tools)))
+    for expected in ("observe", "ui.dump", "ui.find", "ui.wait_for", "ui.tap_match",
+                     "input.tap", "input.text", "app.launch", "app.intent",
+                     "device.clipboard", "wait.idle", "task.checkpoint", "task.rollback"):
         check(f"tool present: {expected}", expected in names)
     schemas_ok = all(t["inputSchema"]["type"] == "object" for t in tools)
     check("all inputSchemas are objects", schemas_ok)
+    arrays_ok = all(
+        "items" in prop
+        for t in tools
+        for prop in t["inputSchema"]["properties"].values()
+        if prop.get("type") == "array"
+    )
+    check("all array properties define items schema", arrays_ok)
     tap = next(t for t in tools if t["name"] == "input.tap")
     check("input.tap x is integer", tap["inputSchema"]["properties"]["x"]["type"] == "integer")
     check("input.tap requires x,y", set(tap["inputSchema"].get("required", [])) == {"x", "y"})
+    lp = next(t for t in tools if t["name"] == "input.long_press")
+    sw = next(t for t in tools if t["name"] == "input.swipe")
+    check("input.long_press requires x,y", set(lp["inputSchema"].get("required", [])) == {"x", "y"})
+    check("input.swipe requires x1,y1,x2,y2",
+          set(sw["inputSchema"].get("required", [])) == {"x1", "y1", "x2", "y2"})
+
+    resources = c.rpc("resources/list")["result"]["resources"]
+    r_uris = {r["uri"] for r in resources}
+    check("resources/list exposes live resources",
+          {"droideum://status", "droideum://ui", "droideum://logcat"} <= r_uris)
+
+    # Verify examples/agent_loop.py produces strict OpenAI-compatible function names
+    import importlib.util
+    import re as _re
+    spec = importlib.util.spec_from_file_location(
+        "agent_loop", os.path.join(ROOT, "examples", "agent_loop.py")
+    )
+    agent_loop = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(agent_loop)
+    oa_tools = agent_loop.openai_tools()
+    check("agent_loop OpenAI tool names match ^[a-zA-Z0-9_-]+$",
+          all(_re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", t["function"]["name"]) for t in oa_tools))
+    check("agent_loop OpenAI tool names round-trip back to MCP tools",
+          all(agent_loop._from_fn_name(t["function"]["name"]) in names for t in oa_tools))
 
     err = c.rpc("tools/call", {"name": "does.not.exist", "arguments": {}})
     body = json.loads(err["result"]["content"][0]["text"])
@@ -318,6 +372,85 @@ def stub_tests():
 
     missing = c.rpc("tools/call", {"name": "app.launch", "arguments": {}})
     check("missing required arg is an error", missing["result"]["isError"] is True)
+
+    inj = c.rpc("tools/call", {"name": "app.launch", "arguments": {"package": "com.bad; reboot"}})
+    inj_body = json.loads(inj["result"]["content"][0]["text"])
+    check("shell metacharacters in package rejected",
+          inj["result"]["isError"] is True and inj_body.get("code") == "BAD_ARGS")
+
+    # v1.4.0: screen_changed delta detection on consecutive identical observations
+    ob1 = c.rpc("tools/call", {"name": "ui.dump", "arguments": {}})["result"]["structuredContent"]
+    ob2 = c.rpc("tools/call", {"name": "ui.dump", "arguments": {}})["result"]["structuredContent"]
+    check("ui.dump includes deterministic ui_hash", len(ob1.get("ui_hash", "")) == 12)
+    check("identical consecutive ui.dump sets screen_changed=False", ob2.get("screen_changed") is False)
+
+    # v1.4.0: ui.wait_for & ui.tap_match
+    wf = c.rpc("tools/call", {"name": "ui.wait_for",
+                              "arguments": {"query": "Continue", "timeout_s": 2}})
+    check("ui.wait_for finds visible element",
+          wf["result"]["isError"] is False and wf["result"]["structuredContent"]["found"] is True)
+    wf_to = c.rpc("tools/call", {"name": "ui.wait_for",
+                                 "arguments": {"query": "NeverVisible", "timeout_s": 0.3, "poll_ms": 100}})
+    wf_err = json.loads(wf_to["result"]["content"][0]["text"])
+    check("ui.wait_for times out with WAIT_TIMEOUT",
+          wf_to["result"]["isError"] is True and wf_err.get("code") == "WAIT_TIMEOUT")
+
+    tm = c.rpc("tools/call", {"name": "ui.tap_match",
+                              "arguments": {"query": "Continue", "wait_s": 1}})
+    check("ui.tap_match finds and taps center in one step",
+          tm["result"]["isError"] is False
+          and tm["result"]["structuredContent"]["tapped"] == [540, 540])
+
+    # v1.4.0: bounds checks on long_press and swipe
+    oob_lp = c.rpc("tools/call", {"name": "input.long_press", "arguments": {"x": 5000, "y": 100}})
+    check("out-of-bounds long_press rejected", oob_lp["result"]["isError"] is True)
+    oob_sw = c.rpc("tools/call", {"name": "input.swipe",
+                                  "arguments": {"x1": 100, "y1": 100, "x2": 100, "y2": 9000}})
+    check("out-of-bounds swipe rejected", oob_sw["result"]["isError"] is True)
+
+    # v1.4.0: Unicode input via ADBKeyboard base64 broadcast + submit=True
+    with open(os.path.join(tmp, "enable_adb_ime"), "w") as fh:
+        fh.write("1")
+    uni_ok = c.rpc("tools/call", {"name": "input.text",
+                                  "arguments": {"text": "café ☕", "submit": True}})
+    check("unicode input succeeds when ADBKeyboard is installed",
+          uni_ok["result"]["isError"] is False
+          and uni_ok["result"]["structuredContent"]["method"] == "adbkeyboard_b64"
+          and uni_ok["result"]["structuredContent"]["submitted"] is True)
+    check("unicode broadcast sent as ADB_INPUT_B64", "ADB_INPUT_B64" in open(calls).read())
+
+    # v1.4.0: split APK bundle (.apks) installation with ABI filtering
+    import zipfile
+    bundle_path = os.path.join(tmp, "sample.apks")
+    with zipfile.ZipFile(bundle_path, "w") as zf:
+        zf.writestr("base.apk", b"BASE")
+        zf.writestr("split_config.arm64_v8a.apk", b"ARM64")
+        zf.writestr("split_config.x86_64.apk", b"X86_64")
+    inst = c.rpc("tools/call", {"name": "app.install", "arguments": {"path": bundle_path}})
+    check("app.install installs split .apks bundle (2 splits kept, arm64 filtered)",
+          inst["result"]["isError"] is False
+          and inst["result"]["structuredContent"].get("splits") == 2)
+
+    # v1.4.0: app.intent & device.clipboard & resources/read
+    intent_res = c.rpc("tools/call", {"name": "app.intent",
+                                      "arguments": {"uri": "https://example.com", "settle_s": 0.05}})
+    check("app.intent dispatches VIEW intent",
+          intent_res["result"]["isError"] is False and "am start" in open(calls).read())
+
+    clip_set = c.rpc("tools/call", {"name": "device.clipboard",
+                                    "arguments": {"action": "set", "text": "otp-482910"}})
+    clip_get = c.rpc("tools/call", {"name": "device.clipboard", "arguments": {"action": "get"}})
+    check("device.clipboard set+get round-trip",
+          clip_set["result"]["isError"] is False
+          and clip_get["result"]["structuredContent"].get("text") == "otp-482910")
+
+    res_status = c.rpc("resources/read", {"uri": "droideum://status"})
+    res_ui = c.rpc("resources/read", {"uri": "droideum://ui"})
+    res_log = c.rpc("resources/read", {"uri": "droideum://logcat"})
+    check("resources/read serves status, ui, and logcat",
+          json.loads(res_status["result"]["contents"][0]["text"])["adb"] is True
+          and json.loads(res_ui["result"]["contents"][0]["text"])["count"] >= 3
+          and "Displayed com.example.app" in res_log["result"]["contents"][0]["text"])
 
     c.close()
 

@@ -25,9 +25,29 @@ cat > "$STUB/qemu-img" <<'EOF'
 #!/bin/sh
 echo "$@" >> "$STUB_CALLS"
 case "$1" in
-  create)  for a in "$@"; do case "$a" in *.img|*.qcow2) target="$a" ;; esac; done
-           : > "${target:-/dev/null}"; echo '{"virtual-size": 17179869184, "format": "qcow2"}' ;;
-  info)    echo '{"virtual-size": 17179869184, "format": "qcow2"}' ;;
+  create)  backing=""; prev=""
+           for a in "$@"; do
+             [ "$prev" = "-b" ] && backing="$a"
+             case "$a" in *.img|*.qcow2) target="$a" ;; esac
+             prev="$a"
+           done
+           : > "${target:-/dev/null}"
+           if [ -n "$backing" ] && [ -n "${target:-}" ]; then
+             printf '%s\n' "$backing" > "${target}.backing"
+           else
+             rm -f "${target:-/nonexistent}.backing" 2>/dev/null || true
+           fi
+           echo '{"virtual-size": 17179869184, "format": "qcow2"}' ;;
+  convert) for a in "$@"; do case "$a" in *.img|*.qcow2) target="$a" ;; esac; done
+           : > "${target:-/dev/null}" ;;
+  info)    for a in "$@"; do case "$a" in *.img|*.qcow2) target="$a" ;; esac; done
+           b=""
+           [ -n "${target:-}" ] && [ -f "${target}.backing" ] && b=$(cat "${target}.backing")
+           if [ -n "$b" ]; then
+             printf '{"virtual-size": 17179869184, "format": "qcow2", "backing-filename": "%s"}\n' "$b"
+           else
+             echo '{"virtual-size": 17179869184, "format": "qcow2"}'
+           fi ;;
   check)   exit 0 ;;
   dd)      # emit a 512-byte MBR; STUB_BOOT=yes gives it a real boot signature
            for a in "$@"; do case "$a" in of=*) dest="${a#of=}" ;; esac; done
@@ -59,14 +79,26 @@ esac
 EOF
 cat > "$STUB/qemu-system-x86_64" <<'EOF'
 #!/bin/sh
+case " $* " in
+  *" --version "*)
+    echo "QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1)"
+    exit 0 ;;
+  *" -accel kvm -machine none "*)
+    cat >/dev/null 2>&1 || true
+    [ "${STUB_KVM_OK:-0}" = "1" ] && exit 0 || exit 1 ;;
+esac
 echo "$@" > "$STUB_CALLS.qemu"
-# Emulate a machine that powers off when the monitor receives 'quit'.
+# Emulate a machine that powers off when the monitor receives 'quit' or ACPI powerdown
+# (unless STUB_IGNORE_ACPI=1 is set to test fallback escalation).
 if [ -n "${STUB_MON_LOG:-}" ]; then
   : > "$STUB_MON_LOG"          # a fresh machine starts with an empty monitor log
   i=0
   while [ "$i" -lt 150 ]; do
     grep -q '^quit$' "$STUB_MON_LOG" 2>/dev/null && exit 0
-    sleep 0.2; i=$((i + 1))
+    if [ "${STUB_IGNORE_ACPI:-0}" != "1" ] && grep -q '^system_powerdown$' "$STUB_MON_LOG" 2>/dev/null; then
+      exit 0
+    fi
+    sleep 0.1; i=$((i + 1))
   done
   exit 0
 fi
@@ -199,6 +231,7 @@ reset_snaps "autosave"
 : > "$STUB_MON_LOG"
 t   "up resumes warm state"  "0" "$(run up)"
 has "up used the snapshot"   "-loadvm autosave" "$STUB_CALLS_QEMU"
+has "up warm resume stays headless" "-display none" "$STUB_CALLS_QEMU"
 has "up waits for boot prop" "adb -s 127.0.0.1:5555 shell getprop sys.boot_completed" "$STUB_CALLS.adb"
 run stop >/dev/null
 reset_snaps ""
@@ -215,6 +248,8 @@ has "animator scale disabled" "settings put global animator_duration_scale 0" "$
 has "screen kept awake"      "svc power stayon true" "$STUB_CALLS.adb"
 has "lock screen disabled"   "locksettings set-disabled true" "$STUB_CALLS.adb"
 has "logcat buffer raised"   "logcat -G 4M" "$STUB_CALLS.adb"
+has "tcg fast dexopt set"    "setprop pm.dexopt.install verify" "$STUB_CALLS.adb"
+has "bg dexopt disabled"     "bg-dexopt-job --disable" "$STUB_CALLS.adb"
 
 echo "== benchmark =="
 t   "bench exits 0"          "0" "$(run bench 1)"
@@ -238,8 +273,11 @@ t   "profile use bliss14"    "0" "$(run profile use bliss14)"
 has "config records profile" "PROFILE_NAME=bliss14" "$DROIDEUM_HOME/droideum.conf"
 has "config skips checksum"  'ISO_SHA1="skip"' "$DROIDEUM_HOME/droideum.conf"
 has "config raises RAM"      'RAM_MB="3072"' "$DROIDEUM_HOME/droideum.conf"
+run setup >/dev/null
+t   "bliss14 caches distinct ISO" "0" "$([ -f "$DROIDEUM_HOME/cache/Bliss-v14.10-x86_64-OFFICIAL-foss-20230310.iso" ] && echo 0 || echo 1)"
 t   "profile use android9"   "0" "$(run profile use android9)"
 has "profile block replaced" "PROFILE_NAME=android9" "$DROIDEUM_HOME/droideum.conf"
+has "android9 restores default ISO URL" "android-x86_64-9.0-r2.iso" "$DROIDEUM_HOME/droideum.conf"
 hasnt "no stale profile block" "PROFILE_NAME=bliss14" "$DROIDEUM_HOME/droideum.conf"
 run profile use android9 >/dev/null
 t   "profile blocks do not pile up" "1" "$(grep -c '>>> droideum profile' "$DROIDEUM_HOME/droideum.conf")"
@@ -248,14 +286,33 @@ t   "unknown profile fails"  "1" "$(run profile use wat)"
 echo "== snapshots =="
 t   "snapshot ok"            "0" "$(run snapshot test1)"
 has "snapshot file"          "-b " "$STUB_CALLS"
+has "working disk backed by snapshot (no self-loop)" "test1.qcow2" "$DROIDEUM_HOME/android.img.backing"
+hasnt "snapshot never backed by itself" "test1.qcow2" "$DROIDEUM_HOME/snapshots/test1.qcow2.backing"
 run snapshots >/dev/null
 has "snapshot listed"        "test1" "$WORK/out"
 t   "restore ok"             "0" "$(run restore test1)"
+t   "repeat restore safe"    "0" "$(run restore test1)"
+has "restored disk still backed by snapshot" "test1.qcow2" "$DROIDEUM_HOME/android.img.backing"
+t   "rm active backing snapshot refused" "1" "$(run snapshot rm test1)"
+t   "snapshot test2 ok"      "0" "$(run snapshot test2)"
+t   "rm inactive snapshot test1 ok" "0" "$(run snapshot rm test1)"
 t   "restore unknown fails"  "1" "$(run restore nope)"
 
 echo "== apk sideboarding =="
 t   "install ok exits 0"     "0" "$(STUB_ADB_MODE=ok run apk install "$WORK/app.apk")"
 has "adb install -r -g used" "install -r -g -d" "$STUB_CALLS.adb"
+python3 - "$WORK/bundle.apks" <<'PYEOF'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "w") as zf:
+    zf.writestr("base.apk", b"BASE")
+    zf.writestr("split_config.arm64_v8a.apk", b"ARM64")
+    zf.writestr("split_config.x86_64.apk", b"X86_64")
+PYEOF
+: > "$STUB_CALLS.adb"
+t   "split bundle (.apks) install exits 0" "0" "$(STUB_ADB_MODE=ok run apk install "$WORK/bundle.apks")"
+has "split bundle uses install-multiple" "install-multiple -r -g -d" "$STUB_CALLS.adb"
+has "split bundle keeps x86_64 split" "split_config.x86_64.apk" "$STUB_CALLS.adb"
+hasnt "split bundle filters foreign arm64 split" "split_config.arm64_v8a.apk" "$STUB_CALLS.adb"
 t   "abi failure exits 1"    "1" "$(STUB_ADB_MODE=abis run apk install "$WORK/app.apk")"
 has "abi advice"             "armbridge" "$WORK/out"
 run apk list >/dev/null
@@ -279,12 +336,13 @@ has "delegation passes args"  "agentd list" "$WORK/out"
 t   "agent config exits 0"   "0" "$(run agent config claude)"
 has "config is an MCP block" '"mcpServers"' "$WORK/out"
 has "config has autostart"   "--autostart" "$WORK/out"
+t   "agent config cursor exits 0" "0" "$(run agent config cursor)"
 t   "unknown agent sub fails" "1" "$(run agent frobnicate)"
 
 echo "== misc =="
 t   "unknown command fails"  "1" "$(run wat)"
 run version >/dev/null
-has "version prints"         "droideum 1.3.0" "$WORK/out"
+has "version prints"         "droideum 1.4.0" "$WORK/out"
 run res 1600x900 320 >/dev/null
 has "res passes wm size"     "wm size 1600x900" "$STUB_CALLS.adb"
 has "res passes wm density"  "wm density 320" "$STUB_CALLS.adb"
